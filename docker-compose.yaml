@@ -1,0 +1,31 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    environment:
+      MACHRING_HTTP_ADDR: ":8080"
+      MACHRING_DATA_DIR: /var/lib/machring
+      MACHRING_DATABASE_PATH: /var/lib/machring/machring.db
+      MACHRING_UPLOAD_DIR: /var/lib/machring/uploads
+      MACHRING_TEMP_DIR: /var/lib/machring/tmp
+      MACHRING_PUBLIC_BASE_URL: ${MACHRING_PUBLIC_BASE_URL:-http://localhost:8080}
+      MACHRING_SITE_NAME: ${MACHRING_SITE_NAME:-马赫环}
+    expose:
+      - "8080"
+    restart: unless-stopped
+    volumes:
+      - ./data:/var/lib/machring
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${MACHRING_WEB_PORT:-8080}:80"
+    restart: unless-stopped

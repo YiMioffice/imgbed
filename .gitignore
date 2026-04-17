@@ -1,0 +1,11 @@
+.env
+.env.local
+.logs/
+data/
+dist/
+node_modules/
+frontend/dist/
+frontend/node_modules/
+*.exe
+*.test
+*.log

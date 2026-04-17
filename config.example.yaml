@@ -1,0 +1,16 @@
+server:
+  addr: ":8080"
+
+storage:
+  driver: "local"
+  data_dir: "./data"
+  database_path: "./data/machring.db"
+  upload_dir: "./data/uploads"
+
+site:
+  name: "马赫环"
+  public_base_url: "http://localhost:8080"
+
+policies:
+  source: "database"
+  bootstrap_defaults: true
