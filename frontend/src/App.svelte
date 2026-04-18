@@ -40,6 +40,52 @@
 
   const groupOptions = ['guest', 'user', 'admin'];
   const resourceTypeOptions = ['image', 'script', 'stylesheet', 'archive', 'executable', 'document', 'font', 'video', 'other'];
+  const megabyte = 1024 * 1024;
+  const gigabyte = 1024 * 1024 * 1024;
+  const groupLabels: Record<string, string> = { guest: '游客', user: '登录用户', admin: '管理员' };
+  const resourceTypeLabels: Record<string, string> = {
+    image: '图片',
+    script: '脚本',
+    stylesheet: '样式表',
+    archive: '压缩包',
+    executable: '可执行文件',
+    document: '文档',
+    font: '字体',
+    video: '视频',
+    other: '其他'
+  };
+  function resolveRouteState(pathname: string) {
+    const segments = pathname.split('/').filter(Boolean);
+    const detailId = segments[0] === 'admin' && segments[1] === 'resources' && segments[2] ? decodeURIComponent(segments[2]) : '';
+    const dashboard = pathname === '/admin' || pathname === '/admin/dashboard';
+    const policy = pathname === '/admin/policies';
+    const resource = pathname === '/admin/resources';
+    const resourceDetail = detailId !== '';
+    const userGroup = pathname === '/admin/user-groups';
+    const user = pathname === '/admin/users';
+    const storage = pathname === '/admin/storage';
+    const siteSettings = pathname === '/admin/site';
+    const featuredAdmin = pathname === '/admin/featured';
+    const explore = pathname === '/explore';
+    const admin = dashboard || policy || resource || userGroup || user || storage || siteSettings || featuredAdmin;
+    return {
+      parts: segments,
+      resourceDetailId: detailId,
+      isDashboardPage: dashboard,
+      isPolicyPage: policy,
+      isResourcePage: resource,
+      isResourceDetailPage: resourceDetail,
+      isUserGroupPage: userGroup,
+      isUserPage: user,
+      isStoragePage: storage,
+      isSiteSettingsPage: siteSettings,
+      isFeaturedAdminPage: featuredAdmin,
+      isExplorePage: explore,
+      isAdminPage: admin,
+      isAdminProtectedPage: admin || resourceDetail,
+      isAccountPage: pathname === '/account'
+    };
+  }
   const emptyRule = (userGroup: string, resourceType: string): PolicyRule => ({ userGroup, resourceType, extension: '', allowUpload: false, allowAccess: false, maxFileSizeBytes: 0, monthlyTrafficPerResourceBytes: 0, monthlyTrafficPerUserAndTypeBytes: 0, requireAuth: false, requireReview: false, forcePrivate: false, cacheControl: '', downloadDisposition: '' });
   const defaultSiteSettings = (): SiteSettings => ({ siteName: '马赫环', externalBaseUrl: '', allowGuestUploads: true, showStatsOnHome: true, showFeaturedOnHome: true });
 
@@ -85,7 +131,7 @@
   let policySaveError = '';
   let policySaveMessage = '';
   let isSavingPolicies = false;
-  let policyForm = { action: 'upload', group: 'guest', filename: 'demo.jpg', contentType: 'image/jpeg', size: 1048576 };
+  let policyForm = { action: 'upload', group: 'guest', filename: 'demo.jpg', contentType: 'image/jpeg', size: 1 };
   let policyResult: PolicyTestResponse | null = null;
   let policyError = '';
   let isTestingPolicy = false;
@@ -156,21 +202,7 @@
   const policyCacheTimestamps = new Map<string, number>();
   const resourceDetailCacheTimestamps = new Map<string, number>();
 
-  $: parts = path.split('/').filter(Boolean);
-  $: resourceDetailId = parts[0] === 'admin' && parts[1] === 'resources' && parts[2] ? decodeURIComponent(parts[2]) : '';
-  $: isDashboardPage = path === '/admin' || path === '/admin/dashboard';
-  $: isPolicyPage = path === '/admin/policies';
-  $: isResourcePage = path === '/admin/resources';
-  $: isResourceDetailPage = resourceDetailId !== '';
-  $: isUserGroupPage = path === '/admin/user-groups';
-  $: isUserPage = path === '/admin/users';
-  $: isStoragePage = path === '/admin/storage';
-  $: isSiteSettingsPage = path === '/admin/site';
-  $: isFeaturedAdminPage = path === '/admin/featured';
-  $: isExplorePage = path === '/explore';
-  $: isAdminPage = isDashboardPage || isPolicyPage || isResourcePage || isUserGroupPage || isUserPage || isStoragePage || isSiteSettingsPage || isFeaturedAdminPage;
-  $: isAdminProtectedPage = isAdminPage || isResourceDetailPage;
-  $: isAccountPage = path === '/account';
+  $: ({ parts, resourceDetailId, isDashboardPage, isPolicyPage, isResourcePage, isResourceDetailPage, isUserGroupPage, isUserPage, isStoragePage, isSiteSettingsPage, isFeaturedAdminPage, isExplorePage, isAdminPage, isAdminProtectedPage, isAccountPage } = resolveRouteState(path));
 
   $: uploadGroup = currentUser?.groupId ?? 'guest';
 
@@ -209,16 +241,17 @@
   function invalidateCache(...keys: Array<keyof typeof cacheTimestamps>) {
     for (const key of keys) cacheTimestamps[key] = 0;
   }
-  function currentResourcesKey() {
+  function currentResourcesKey(featured = isFeaturedAdminPage) {
     return JSON.stringify({
       page: resourcePage,
       pageSize: resourcePageSize,
       filters: resourceFilters,
-      featured: isFeaturedAdminPage
+      featured
     });
   }
 
   async function handleRouteChange() {
+    const route = resolveRouteState(path);
     const token = ++routeLoadToken;
 
     if (!installState?.initialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) {
@@ -233,26 +266,26 @@
       await navigate(currentUser.role === 'admin' ? '/admin' : '/account', true);
       return;
     }
-    if (isAdminProtectedPage && authReady && (!currentUser || currentUser.role !== 'admin')) {
+    if (route.isAdminProtectedPage && authReady && (!currentUser || currentUser.role !== 'admin')) {
       await navigate(currentUser ? '/account' : '/login', true);
       return;
     }
 
     const tasks: Promise<unknown>[] = [];
-    if (path === '/' || isDashboardPage) tasks.push(loadHomeStats());
-    if (path === '/' || isExplorePage || isFeaturedAdminPage) tasks.push(loadFeaturedResources(true));
-    if (path === '/upload' || isAccountPage) tasks.push(loadAccountUsage());
+    if (path === '/' || route.isDashboardPage) tasks.push(loadHomeStats());
+    if (path === '/' || route.isExplorePage || route.isFeaturedAdminPage) tasks.push(loadFeaturedResources(true));
+    if (path === '/upload' || route.isAccountPage) tasks.push(loadAccountUsage());
 
-    if (currentUser?.role === 'admin' && isAdminProtectedPage) {
-      if (isDashboardPage) tasks.push(loadDashboardData());
-      if (isPolicyPage) tasks.push(loadPolicyEditor());
-      if (isUserGroupPage) tasks.push(loadUserGroups());
-      if (isUserPage) tasks.push(loadUserAdminData());
-      if (isStoragePage) tasks.push(loadStorageConfigs());
-      if (isSiteSettingsPage) tasks.push(loadSiteSettings());
-      if (isFeaturedAdminPage) tasks.push(loadResources());
-      if (isResourcePage) tasks.push(loadResources());
-      if (isResourceDetailPage) tasks.push(loadResourceDetail(resourceDetailId));
+    if (currentUser?.role === 'admin' && route.isAdminProtectedPage) {
+      if (route.isDashboardPage) tasks.push(loadDashboardData());
+      if (route.isPolicyPage) tasks.push(loadPolicyEditor());
+      if (route.isUserGroupPage) tasks.push(loadUserGroups());
+      if (route.isUserPage) tasks.push(loadUserAdminData());
+      if (route.isStoragePage) tasks.push(loadStorageConfigs());
+      if (route.isSiteSettingsPage) tasks.push(loadSiteSettings());
+      if (route.isFeaturedAdminPage) tasks.push(loadResources(resourcePage, false, true));
+      if (route.isResourcePage) tasks.push(loadResources(resourcePage, false, false));
+      if (route.isResourceDetailPage) tasks.push(loadResourceDetail(route.resourceDetailId));
     }
 
     await Promise.all(tasks);
@@ -459,7 +492,7 @@
       uploadQueue = uploadQueue.map((item, index) => {
         const result = items[index];
         if (!result) return { ...item, status: 'error', progress: 0, message: '上传结果缺失' };
-        return { ...item, progress: result.success ? 1 : 0, status: result.success ? 'success' : 'error', resource: result.resource, links: result.links, message: result.success ? (result.decision?.reason || '上传完成') : (result.error?.message || result.decision?.reason || '上传失败'), errorCode: result.error?.code };
+        return { ...item, progress: result.success ? 1 : 0, status: result.success ? 'success' : 'error', resource: result.resource, links: result.links, message: result.success ? translateSystemMessage(result.decision?.reason || '上传完成') : translateSystemMessage(result.error?.message || result.decision?.reason || '上传失败'), errorCode: result.error?.code };
       });
       uploadProgress = 1;
       invalidateCache('homeStats', 'accountUsage', 'resources', 'featuredResources');
@@ -518,7 +551,7 @@
   }
   function syncMatrixFromRules(rules: PolicyRule[]) { const baseMap = new Map<string, PolicyRule>(); const overrides: PolicyRule[] = []; for (const rule of rules) { if (rule.extension) overrides.push({ ...rule }); else baseMap.set(`${rule.userGroup}|${rule.resourceType}`, { ...rule, extension: '' }); } matrixBaseRules = []; for (const group of groupOptions) for (const type of resourceTypeOptions) matrixBaseRules.push(baseMap.get(`${group}|${type}`) ?? emptyRule(group, type)); matrixOverrideRules = overrides; matrixError = ''; }
   function collectMatrixRules() { return [...matrixBaseRules, ...matrixOverrideRules].map((rule) => ({ ...rule, extension: (rule.extension ?? '').trim().replace(/^\./, '').toLowerCase(), cacheControl: (rule.cacheControl ?? '').trim(), downloadDisposition: (rule.downloadDisposition ?? '').trim() })).filter((rule) => rule.userGroup && rule.resourceType); }
-  function validateMatrixRules(rules: PolicyRule[]) { const errors: string[] = []; const seen = new Set<string>(); for (const [index, rule] of rules.entries()) { const label = rule.extension ? `扩展规则 ${index + 1}` : `${rule.userGroup}/${rule.resourceType}`; if (!groupOptions.includes(rule.userGroup)) errors.push(`${label} 的用户组无效`); if (!resourceTypeOptions.includes(rule.resourceType)) errors.push(`${label} 的资源类型无效`); if (rule.extension && !/^[a-z0-9]+$/.test(rule.extension)) errors.push(`${label} 的扩展名只能包含小写字母和数字`); if (rule.maxFileSizeBytes < 0 || rule.monthlyTrafficPerResourceBytes < 0 || rule.monthlyTrafficPerUserAndTypeBytes < 0) errors.push(`${label} 的数值必须大于等于 0`); if (rule.downloadDisposition && rule.downloadDisposition !== 'inline' && rule.downloadDisposition !== 'attachment') errors.push(`${label} 的下载策略无效`); const key = `${rule.userGroup}|${rule.resourceType}|${rule.extension ?? ''}`; if (seen.has(key)) errors.push(`${label} 与其他规则重复`); seen.add(key); } return errors; }
+  function validateMatrixRules(rules: PolicyRule[]) { const errors: string[] = []; const seen = new Set<string>(); for (const [index, rule] of rules.entries()) { const label = rule.extension ? `扩展规则 ${index + 1}` : `${groupLabel(rule.userGroup)}/${resourceTypeLabel(rule.resourceType)}`; if (!groupOptions.includes(rule.userGroup)) errors.push(`${label} 的用户组无效`); if (!resourceTypeOptions.includes(rule.resourceType)) errors.push(`${label} 的资源类型无效`); if (rule.extension && !/^[a-z0-9]+$/.test(rule.extension)) errors.push(`${label} 的扩展名只能包含小写字母和数字`); if (rule.maxFileSizeBytes < 0 || rule.monthlyTrafficPerResourceBytes < 0 || rule.monthlyTrafficPerUserAndTypeBytes < 0) errors.push(`${label} 的数值必须大于等于 0`); if (rule.downloadDisposition && rule.downloadDisposition !== 'inline' && rule.downloadDisposition !== 'attachment') errors.push(`${label} 的下载策略无效`); const key = `${rule.userGroup}|${rule.resourceType}|${rule.extension ?? ''}`; if (seen.has(key)) errors.push(`${label} 与其他规则重复`); seen.add(key); } return errors; }
   function addOverrideRule() { matrixOverrideRules = [...matrixOverrideRules, { ...emptyRule('guest', 'image'), extension: 'jpg', allowAccess: true }]; }
   function removeOverrideRule(index: number) { matrixOverrideRules = matrixOverrideRules.filter((_, current) => current !== index); }
   function applyAdvancedJson() { matrixError = ''; try { const parsed = JSON.parse(rulesJson); if (!Array.isArray(parsed)) return void (matrixError = '高级 JSON 必须是规则数组。'); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); syncMatrixFromRules(parsed); rulesJson = JSON.stringify(parsed, null, 2); } catch (error) { matrixError = error instanceof Error ? error.message : '高级 JSON 解析失败'; } }
@@ -526,7 +559,7 @@
   async function copyPolicyGroup(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `${group.name} 副本` }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '复制策略组失败'); selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '复制策略组失败'; } }
   async function setPolicyGroupActive(group: PolicyGroup, active: boolean) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '更新策略组状态失败'); await loadPolicyEditor(selectedPolicyGroupId || payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '更新策略组状态失败'; } }
   async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.delete(selectedPolicyGroupId); cacheTimestamps.policyGroups = 0; policySaveMessage = '策略已保存。'; await loadPolicyGroups(true); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
-  async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: Number(policyForm.size) || 0 }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
+  async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: unitToBytes(String(policyForm.size), megabyte) }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
   async function loadUserGroups(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.userGroups, cacheTTL.userGroups)) return; if (!silent) { userGroupError = ''; userGroupMessage = ''; } return runDeduped('userGroups', async () => { try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; cacheTimestamps.userGroups = Date.now(); } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }); }
   async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } }
   async function loadUsers(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.users, cacheTTL.users)) return; if (!silent) { userAdminError = ''; userAdminMessage = ''; } return runDeduped('users', async () => { try { const res = await fetch('/api/v1/users'); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '加载用户失败'); managedUsers = payload.users ?? []; cacheTimestamps.users = Date.now(); } catch (error) { if (!silent) userAdminError = error instanceof Error ? error.message : '加载用户失败'; } }); }
@@ -622,9 +655,9 @@
   async function toggleUserBan(user: ManagedUser) { const nextStatus = user.status === 'banned' ? 'active' : 'banned'; if (!window.confirm(`${nextStatus === 'banned' ? '确认封禁' : '确认解封'} ${user.displayName} 吗？`)) return; await saveManagedUser({ ...user, status: nextStatus }); }
   async function resetManagedUserPassword(user: ManagedUser) { const password = window.prompt(`为 ${user.displayName} 输入新密码`, ''); if (!password) return; if (password.length < 8) return void (userAdminError = '新密码至少需要 8 位。'); if (!window.confirm(`确认重置 ${user.displayName} 的密码吗？`)) return; userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '重置密码失败'); userAdminMessage = `${user.displayName} 的密码已重置。`; } catch (error) { userAdminError = error instanceof Error ? error.message : '重置密码失败'; } }
 
-  async function loadResources(page = resourcePage, force = false) {
+  async function loadResources(page = resourcePage, force = false, featured = isFeaturedAdminPage) {
     resourcePage = page;
-    const nextKey = currentResourcesKey();
+    const nextKey = currentResourcesKey(featured);
     if (!force && resources.length > 0 && resourcesCacheKey === nextKey && isFresh(cacheTimestamps.resources, cacheTTL.resources)) return;
     isLoadingResources = true;
     resourceError = '';
@@ -771,8 +804,28 @@
   function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = value; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`; }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
-  function resourceBadge(record: ResourceRecord) { return `${record.type} · ${formatBytes(record.size)} · ${record.isPrivate ? '私有' : '公开'} · ${record.status === 'deleted' ? '已删除' : '正常'}`; }
-  function securityHint(record: ResourceRecord) { if (record.isPrivate) return '私有资源默认拒绝匿名直链访问，可使用签名链接按时效开放。'; if (record.type === 'image') return '图片资源可直接预览。'; if (record.type === 'script' || record.type === 'executable') return '脚本和可执行资源会强制下载，避免浏览器直接执行。'; return '非图片资源展示类型、大小、下载策略和安全提示。'; }
+  function groupLabel(value: string) { return groupLabels[value] ?? value; }
+  function resourceTypeLabel(value: string) { return resourceTypeLabels[value] ?? value; }
+  function dispositionLabel(value?: string) { return value === 'attachment' ? '强制下载' : '页面内打开'; }
+  function translateSystemMessage(value = '') {
+    if (!value) return '';
+    if (value === 'allowed by policy') return '策略允许';
+    if (value === 'upload denied by policy') return '策略禁止上传';
+    if (value === 'access denied by policy') return '策略禁止访问';
+    if (value === 'login required by policy') return '策略要求先登录';
+    if (value.startsWith('file size exceeds policy limit')) return '文件大小超过策略上限';
+    if (value.startsWith('no policy rule matched')) return '没有匹配的策略规则';
+    if (value.startsWith('unsupported policy action')) return '不支持的策略动作';
+    return value;
+  }
+  function bytesToUnit(value: number, unit: number) { if (!value) return '0'; const converted = value / unit; return Number.isInteger(converted) ? String(converted) : converted.toFixed(2).replace(/\.?0+$/, ''); }
+  function unitToBytes(raw: string, unit: number) { const normalized = Number(raw); if (!Number.isFinite(normalized) || normalized <= 0) return 0; return Math.round(normalized * unit); }
+  function updateRuleMaxFileSize(rule: PolicyRule, value: string) { rule.maxFileSizeBytes = unitToBytes(value, megabyte); matrixBaseRules = [...matrixBaseRules]; }
+  function updateRuleMonthlyTraffic(rule: PolicyRule, value: string) { rule.monthlyTrafficPerResourceBytes = unitToBytes(value, gigabyte); matrixBaseRules = [...matrixBaseRules]; }
+  function updateOverrideMaxFileSize(index: number, value: string) { matrixOverrideRules[index].maxFileSizeBytes = unitToBytes(value, megabyte); matrixOverrideRules = [...matrixOverrideRules]; }
+  function updateOverrideMonthlyTraffic(index: number, value: string) { matrixOverrideRules[index].monthlyTrafficPerResourceBytes = unitToBytes(value, gigabyte); matrixOverrideRules = [...matrixOverrideRules]; }
+  function resourceBadge(record: ResourceRecord) { return `${resourceTypeLabel(record.type)} · ${formatBytes(record.size)} · ${record.isPrivate ? '私有' : '公开'} · ${record.status === 'deleted' ? '已删除' : '正常'}`; }
+  function securityHint(record: ResourceRecord) { if (record.isPrivate) return '私有资源默认拒绝匿名直链访问，可使用签名链接按时效开放。'; if (record.type === 'image') return '图片资源可直接预览。'; if (record.type === 'video') return '视频资源可在详情页内直接预览。'; if (record.type === 'script' || record.type === 'executable') return '脚本和可执行资源会强制下载，避免浏览器直接执行。'; return '非图片资源展示类型、大小、下载策略和安全提示。'; }
   function isFeaturedResource(resourceId: string) { return featuredResources.some((item) => item.resource.id === resourceId); }
   function homeFeaturedResources() { return featuredResources.slice(0, 4); }
   function quotaHint(group?: UserGroup | null) { if (!group) return '当前没有用户组配额信息。'; const parts: string[] = []; if (group.maxFileSizeBytes > 0) parts.push(`单文件 ${formatBytes(group.maxFileSizeBytes)}`); if (group.totalCapacityBytes > 0) parts.push(`总容量 ${formatBytes(group.totalCapacityBytes)}`); if (group.dailyUploadLimit > 0) parts.push(`每日 ${group.dailyUploadLimit} 次`); if (group.defaultMonthlyTrafficBytes > 0) parts.push(`默认月流量 ${formatBytes(group.defaultMonthlyTrafficBytes)}`); return parts.length > 0 ? parts.join(' · ') : '当前用户组未设置额外配额。'; }
@@ -802,7 +855,7 @@
 {#if !bootstrapReady}
   <main class="page-shell narrow">
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Static Hosting</p>
+      <p class="eyebrow">马赫环静态托管</p>
       <h1>正在加载</h1>
       <p class="lead compact">正在读取站点状态和登录信息。</p>
     </section>
@@ -811,7 +864,7 @@
   <main class="page-shell narrow">
     <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Static Hosting</p>
+      <p class="eyebrow">马赫环静态托管</p>
       <h1>初始化</h1>
       <form class="resource-form" on:submit|preventDefault={initializeSite}>
         <label>站点名称<input bind:value={installForm.siteName} /></label>
@@ -831,7 +884,7 @@
     <section class="glass-panel page-panel upload-panel">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Machring Static Hosting</p>
+          <p class="eyebrow">马赫环静态托管</p>
           <h1>上传</h1>
           <p class="lead compact">支持拖拽、点击选择、粘贴与批量上传。每个文件都会返回独立结果与全部外链格式。</p>
         </div>
@@ -876,9 +929,9 @@
                     </div>
                     <div class="link-grid compact">
                       <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.direct || '')}>复制直链</button>
-                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.markdown || '')}>复制 Markdown</button>
-                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.html || '')}>复制 HTML</button>
-                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.bbcode || '')}>复制 BBCode</button>
+                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.markdown || '')}>复制 Markdown 链接</button>
+                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.html || '')}>复制 HTML 代码</button>
+                      <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.bbcode || '')}>复制 BBCode 代码</button>
                     </div>
                   {/if}
                 </article>
@@ -899,7 +952,7 @@
     <section class="glass-panel page-panel">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Machring Account</p>
+          <p class="eyebrow">账户中心</p>
           <h1>账户用量</h1>
           <p class="lead compact">查看当前账户所属用户组、存储占用、月流量和每日上传次数。</p>
         </div>
@@ -935,7 +988,7 @@
   <main class="page-shell narrow">
     <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Static Hosting</p>
+      <p class="eyebrow">马赫环静态托管</p>
       <h1>登录</h1>
       <form class="resource-form" on:submit|preventDefault={login}>
         <label>账号<input bind:value={loginForm.username} autocomplete="username" /></label>
@@ -949,7 +1002,7 @@
   {#if !authReady}
   <main class="page-shell narrow">
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Resource Detail</p>
+      <p class="eyebrow">资源详情</p>
       <h1>正在检查登录状态</h1>
       <p class="lead compact">正在确认管理员会话。</p>
     </section>
@@ -957,7 +1010,7 @@
   {:else if !currentUser || currentUser.role !== 'admin'}
   <main class="page-shell narrow">
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Resource Detail</p>
+      <p class="eyebrow">资源详情</p>
       <h1>需要管理员登录</h1>
       <p class="lead compact">正在跳转到登录页。</p>
     </section>
@@ -968,7 +1021,7 @@
     <section class="glass-panel page-panel resource-detail-page">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Machring Resource Detail</p>
+          <p class="eyebrow">资源详情</p>
           <h1>资源详情</h1>
           <p class="lead compact">独立查看资源元数据、流量、外链和访问窗口。</p>
         </div>
@@ -1008,12 +1061,12 @@
             <div class="link-grid">
               <label>直链<input readonly value={resourceDetail.links.direct} /></label>
               <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.direct)}>复制直链</button>
-              <label>Markdown<input readonly value={resourceDetail.links.markdown} /></label>
-              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.markdown)}>复制 Markdown</button>
-              <label>HTML<input readonly value={resourceDetail.links.html} /></label>
-              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.html)}>复制 HTML</button>
-              <label>BBCode<input readonly value={resourceDetail.links.bbcode} /></label>
-              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.bbcode)}>复制 BBCode</button>
+              <label>Markdown 链接<input readonly value={resourceDetail.links.markdown} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.markdown)}>复制 Markdown 链接</button>
+              <label>HTML 代码<input readonly value={resourceDetail.links.html} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.html)}>复制 HTML 代码</button>
+              <label>BBCode 代码<input readonly value={resourceDetail.links.bbcode} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.bbcode)}>复制 BBCode 代码</button>
               <label>签名链接有效期（秒）<input bind:value={signedLinkExpiresInSeconds} min="60" max="604800" type="number" /></label>
               <button class="button ghost compact" type="button" on:click={() => generateSignedLink(resourceDetail.record.id)}>生成签名链接</button>
               <label>签名链接<input readonly value={signedLinkResult?.url ?? ''} /></label>
@@ -1035,7 +1088,7 @@
               <div><dt>对象键</dt><dd>{resourceDetail.record.objectKey}</dd></div>
               <div><dt>MIME</dt><dd>{resourceDetail.record.contentType || '未知'}</dd></div>
               <div><dt>缓存策略</dt><dd>{resourceDetail.record.cacheControl || '未设置'}</dd></div>
-              <div><dt>下载策略</dt><dd>{resourceDetail.record.disposition || 'inline'}</dd></div>
+              <div><dt>下载策略</dt><dd>{dispositionLabel(resourceDetail.record.disposition)}</dd></div>
               <div><dt>上传 IP</dt><dd>{resourceDetail.record.uploadIp || '无'}</dd></div>
               <div><dt>User-Agent</dt><dd>{resourceDetail.record.uploadUserAgent || '无'}</dd></div>
               <div><dt>头摘要</dt><dd>{resourceDetail.metadata.headerSha256 || '无'}</dd></div>
@@ -1063,7 +1116,7 @@
   {#if !authReady}
   <main class="page-shell narrow">
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Admin</p>
+      <p class="eyebrow">后台管理</p>
       <h1>正在检查登录状态</h1>
       <p class="lead compact">正在确认管理员会话。</p>
     </section>
@@ -1071,7 +1124,7 @@
   {:else if !currentUser}
   <main class="page-shell narrow">
     <section class="glass-panel page-panel">
-      <p class="eyebrow">Machring Admin</p>
+      <p class="eyebrow">后台管理</p>
       <h1>需要管理员登录</h1>
       <p class="lead compact">正在跳转到登录页。</p>
     </section>
@@ -1080,7 +1133,7 @@
   <main class="admin-shell">
     <aside class="admin-sidebar glass-panel" aria-label="后台导航">
       <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
-      <p class="eyebrow">Machring Admin</p>
+      <p class="eyebrow">后台管理</p>
       <h1>后台</h1>
       <nav class="admin-nav" aria-label="后台功能">
         <a class:active={isDashboardPage} class="admin-nav-link" href="/admin" on:click|preventDefault={() => navigate('/admin')}>仪表盘</a>
@@ -1096,7 +1149,7 @@
     </aside>
     <section class="admin-workspace glass-panel">
       {#if isDashboardPage}
-        <div class="section-heading"><p class="eyebrow">Admin Dashboard</p><h2>仪表盘</h2><p>汇总站点资源、用户和今日活动，作为块 7 的后台核心统计入口。</p></div>
+        <div class="section-heading"><p class="eyebrow">后台仪表盘</p><h2>仪表盘</h2><p>汇总站点资源、用户和今日活动，作为后台的核心统计入口。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         <div class="stats-grid dashboard-grid">
           <article><span>资源总数</span><strong>{homeStats.totalResources}</strong></article>
@@ -1114,7 +1167,7 @@
           {/each}
         </div>
       {:else if isPolicyPage}
-        <div class="section-heading"><p class="eyebrow">Policy Groups</p><h2>策略组</h2><p>复制、启用、停用不同策略组，并对选中策略组直接编辑规则。</p></div>
+        <div class="section-heading"><p class="eyebrow">策略组管理</p><h2>策略组</h2><p>复制、启用、停用不同策略组，并对选中策略组直接编辑规则。</p></div>
         <div class="admin-session"><span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span></div>
         <div class="policy-groups-layout">
           <section class="policy-groups-panel">
@@ -1139,14 +1192,14 @@
                 <button class="button primary" type="button" disabled={isSavingPolicies || !currentUser || !selectedPolicyGroupId} on:click={savePolicies}>{isSavingPolicies ? '保存中' : '保存策略'}</button>
               </div>
             </div>
-            <div class="matrix-block"><table class="policy-matrix-table"><thead><tr><th>用户组</th><th>资源类型</th><th>上传</th><th>访问</th><th>单文件</th><th>月流量</th><th>下载</th><th>缓存</th></tr></thead><tbody>{#each matrixBaseRules as rule, index}<tr><td>{rule.userGroup}</td><td>{rule.resourceType}</td><td><input aria-label={`allow upload ${index}`} type="checkbox" bind:checked={rule.allowUpload} /></td><td><input aria-label={`allow access ${index}`} type="checkbox" bind:checked={rule.allowAccess} /></td><td><input aria-label={`max file ${index}`} type="number" min="0" bind:value={rule.maxFileSizeBytes} /></td><td><input aria-label={`monthly traffic ${index}`} type="number" min="0" bind:value={rule.monthlyTrafficPerResourceBytes} /></td><td><select aria-label={`disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">inline</option><option value="attachment">attachment</option></select></td><td><input aria-label={`cache ${index}`} bind:value={rule.cacheControl} placeholder="public, max-age=31536000" /></td></tr>{/each}</tbody></table></div>
-            <div class="override-panel"><div class="subsection-heading"><h3>扩展名覆盖</h3><p>用于按扩展名覆盖同类资源的默认规则。</p></div><button class="button secondary compact" type="button" on:click={addOverrideRule}>添加覆盖规则</button><div class="override-list">{#each matrixOverrideRules as rule, index}<div class="override-row"><input aria-label={`override group ${index}`} bind:value={rule.userGroup} list="group-options" /><input aria-label={`override type ${index}`} bind:value={rule.resourceType} list="resource-type-options" /><input aria-label={`override ext ${index}`} bind:value={rule.extension} placeholder="jpg" /><label><span>上传</span><input type="checkbox" bind:checked={rule.allowUpload} /></label><label><span>访问</span><input type="checkbox" bind:checked={rule.allowAccess} /></label><input aria-label={`override max ${index}`} type="number" min="0" bind:value={rule.maxFileSizeBytes} /><input aria-label={`override monthly ${index}`} type="number" min="0" bind:value={rule.monthlyTrafficPerResourceBytes} /><select aria-label={`override disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">inline</option><option value="attachment">attachment</option></select><button class="button ghost compact" type="button" on:click={() => removeOverrideRule(index)}>移除</button></div>{/each}</div><datalist id="group-options">{#each groupOptions as option}<option value={option}></option>{/each}</datalist><datalist id="resource-type-options">{#each resourceTypeOptions as option}<option value={option}></option>{/each}</datalist></div>
+            <div class="matrix-block"><table class="policy-matrix-table"><thead><tr><th>用户组</th><th>资源类型</th><th>允许上传</th><th>允许访问</th><th>单文件上限 (MB)</th><th>单资源月流量上限 (GB)</th><th>下载方式</th><th>缓存策略</th></tr></thead><tbody>{#each matrixBaseRules as rule, index}<tr><td>{groupLabel(rule.userGroup)}</td><td>{resourceTypeLabel(rule.resourceType)}</td><td><input aria-label={`allow upload ${index}`} type="checkbox" bind:checked={rule.allowUpload} /></td><td><input aria-label={`allow access ${index}`} type="checkbox" bind:checked={rule.allowAccess} /></td><td><input aria-label={`max file ${index}`} type="number" min="0" step="0.1" value={bytesToUnit(rule.maxFileSizeBytes, megabyte)} on:input={(event) => updateRuleMaxFileSize(rule, (event.currentTarget as HTMLInputElement).value)} /></td><td><input aria-label={`monthly traffic ${index}`} type="number" min="0" step="0.1" value={bytesToUnit(rule.monthlyTrafficPerResourceBytes, gigabyte)} on:input={(event) => updateRuleMonthlyTraffic(rule, (event.currentTarget as HTMLInputElement).value)} /></td><td><select aria-label={`disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">页面内打开</option><option value="attachment">强制下载</option></select></td><td><input aria-label={`cache ${index}`} bind:value={rule.cacheControl} placeholder="例如：public, max-age=31536000" /></td></tr>{/each}</tbody></table></div>
+            <div class="override-panel"><div class="subsection-heading"><h3>扩展名覆盖</h3><p>用于按扩展名覆盖同类资源的默认规则。</p></div><button class="button secondary compact" type="button" on:click={addOverrideRule}>添加覆盖规则</button><div class="override-list">{#each matrixOverrideRules as rule, index}<div class="override-row"><select aria-label={`override group ${index}`} bind:value={rule.userGroup}>{#each groupOptions as option}<option value={option}>{groupLabel(option)}</option>{/each}</select><select aria-label={`override type ${index}`} bind:value={rule.resourceType}>{#each resourceTypeOptions as option}<option value={option}>{resourceTypeLabel(option)}</option>{/each}</select><input aria-label={`override ext ${index}`} bind:value={rule.extension} placeholder="例如：jpg" /><label><span>上传</span><input type="checkbox" bind:checked={rule.allowUpload} /></label><label><span>访问</span><input type="checkbox" bind:checked={rule.allowAccess} /></label><input aria-label={`override max ${index}`} type="number" min="0" step="0.1" value={bytesToUnit(rule.maxFileSizeBytes, megabyte)} on:input={(event) => updateOverrideMaxFileSize(index, (event.currentTarget as HTMLInputElement).value)} /><input aria-label={`override monthly ${index}`} type="number" min="0" step="0.1" value={bytesToUnit(rule.monthlyTrafficPerResourceBytes, gigabyte)} on:input={(event) => updateOverrideMonthlyTraffic(index, (event.currentTarget as HTMLInputElement).value)} /><select aria-label={`override disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">页面内打开</option><option value="attachment">强制下载</option></select><button class="button ghost compact" type="button" on:click={() => removeOverrideRule(index)}>移除</button></div>{/each}</div></div>
             {#if matrixError}<p class="form-error">{matrixError}</p>{/if}
             {#if policySaveError}<p class="form-error">{policySaveError}</p>{:else if policySaveMessage}<p class="form-success">{policySaveMessage}</p>{/if}
             <details class="policy-json-details"><summary>高级 JSON</summary><textarea bind:value={rulesJson} rows="12" spellcheck="false"></textarea><button class="button secondary compact" type="button" on:click={applyAdvancedJson}>应用 JSON</button></details>
           </section>
         </div>
-        <div class="policy-test-section"><div class="subsection-heading"><h3>策略测试</h3><p>测试结果会显示当前命中的启用策略组。</p></div><form class="policy-test-form" on:submit|preventDefault={runPolicyTest}><label>动作<select bind:value={policyForm.action}><option value="upload">上传</option><option value="access">访问</option></select></label><label>用户组<select bind:value={policyForm.group}><option value="guest">游客</option><option value="user">登录用户</option><option value="admin">管理员</option></select></label><label>文件名<input bind:value={policyForm.filename} placeholder="demo.jpg" /></label><label>MIME<input bind:value={policyForm.contentType} placeholder="image/jpeg" /></label><label>文件大小<input bind:value={policyForm.size} min="0" type="number" /></label><button class="button primary" type="submit" disabled={isTestingPolicy || !currentUser}>{isTestingPolicy ? '测试中' : '测试策略'}</button></form><div class="policy-outcome" aria-live="polite">{#if policyError}<p class="result-state denied">测试失败</p><p>{policyError}</p>{:else if policyResult}<p class:allowed={policyResult.decision.allowed} class:denied={!policyResult.decision.allowed} class="result-state">{policyResult.decision.allowed ? '允许' : '拒绝'}</p><dl class="result-list"><div><dt>命中策略组</dt><dd>{policyResult.policyGroup.name}</dd></div><div><dt>原因</dt><dd>{policyResult.decision.reason}</dd></div><div><dt>资源类型</dt><dd>{policyResult.metadata.type}</dd></div><div><dt>扩展名</dt><dd>{policyResult.metadata.extension || '无'}</dd></div><div><dt>命中用户组</dt><dd>{policyResult.decision.rule.userGroup || '无'}</dd></div><div><dt>单文件限制</dt><dd>{formatBytes(policyResult.decision.rule.maxFileSizeBytes)}</dd></div><div><dt>单资源月流量</dt><dd>{formatBytes(policyResult.decision.rule.monthlyTrafficPerResourceBytes)}</dd></div><div><dt>下载策略</dt><dd>{policyResult.decision.rule.downloadDisposition || 'inline'}</dd></div></dl>{:else}<p class="result-state">等待测试</p><p>示例默认按游客上传 1 MB JPG 资源。</p>{/if}</div></div>
+        <div class="policy-test-section"><div class="subsection-heading"><h3>策略测试</h3><p>测试结果会显示当前命中的启用策略组。</p></div><form class="policy-test-form" on:submit|preventDefault={runPolicyTest}><label>动作<select bind:value={policyForm.action}><option value="upload">上传</option><option value="access">访问</option></select></label><label>用户组<select bind:value={policyForm.group}><option value="guest">游客</option><option value="user">登录用户</option><option value="admin">管理员</option></select></label><label>文件名<input bind:value={policyForm.filename} placeholder="demo.jpg" /></label><label>MIME<input bind:value={policyForm.contentType} placeholder="image/jpeg" /></label><label>文件大小 (MB)<input bind:value={policyForm.size} min="0" step="0.1" type="number" /></label><button class="button primary" type="submit" disabled={isTestingPolicy || !currentUser}>{isTestingPolicy ? '测试中' : '测试策略'}</button></form><div class="policy-outcome" aria-live="polite">{#if policyError}<p class="result-state denied">测试失败</p><p>{policyError}</p>{:else if policyResult}<p class:allowed={policyResult.decision.allowed} class:denied={!policyResult.decision.allowed} class="result-state">{policyResult.decision.allowed ? '允许' : '拒绝'}</p><dl class="result-list"><div><dt>命中策略组</dt><dd>{policyResult.policyGroup.name}</dd></div><div><dt>原因</dt><dd>{policyResult.decision.reason}</dd></div><div><dt>资源类型</dt><dd>{resourceTypeLabel(policyResult.metadata.type)}</dd></div><div><dt>扩展名</dt><dd>{policyResult.metadata.extension || '无'}</dd></div><div><dt>命中用户组</dt><dd>{groupLabel(policyResult.decision.rule.userGroup || '') || '无'}</dd></div><div><dt>单文件限制</dt><dd>{formatBytes(policyResult.decision.rule.maxFileSizeBytes)}</dd></div><div><dt>单资源月流量</dt><dd>{formatBytes(policyResult.decision.rule.monthlyTrafficPerResourceBytes)}</dd></div><div><dt>下载策略</dt><dd>{dispositionLabel(policyResult.decision.rule.downloadDisposition)}</dd></div></dl>{:else}<p class="result-state">等待测试</p><p>示例默认按游客上传 1 MB JPG 资源。</p>{/if}</div></div>
       {:else if isUserGroupPage}
         <div class="section-heading"><p class="eyebrow">User Groups</p><h2>用户组与配额</h2><p>统一设置游客、普通用户、管理员的容量、单文件、默认月流量、每日上传次数和外链权限。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
@@ -1169,14 +1222,14 @@
           {/each}
         </div>
       {:else if isUserPage}
-        <div class="section-heading"><p class="eyebrow">Users</p><h2>用户管理</h2><p>管理员可以创建用户、编辑昵称/状态/用户组，并对封禁与重置密码进行二次确认。</p></div>
+        <div class="section-heading"><p class="eyebrow">用户管理</p><h2>用户管理</h2><p>管理员可以创建用户、编辑昵称、状态、用户组，并对封禁与重置密码进行二次确认。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         <form class="resource-filter-grid" on:submit|preventDefault={createManagedUser}>
           <label>账号<input bind:value={createUserForm.username} /></label>
           <label>昵称<input bind:value={createUserForm.displayName} /></label>
           <label>初始密码<input bind:value={createUserForm.password} type="password" /></label>
           <label>用户组<select bind:value={createUserForm.groupId}>{#each userGroups as group}<option value={group.id}>{group.name}</option>{/each}</select></label>
-          <label>状态<select bind:value={createUserForm.status}><option value="active">active</option><option value="disabled">disabled</option><option value="banned">banned</option></select></label>
+          <label>状态<select bind:value={createUserForm.status}><option value="active">正常</option><option value="disabled">停用</option><option value="banned">封禁</option></select></label>
           <button class="button primary filter-submit" type="submit">创建用户</button>
         </form>
         {#if userAdminError}<p class="form-error">{userAdminError}</p>{:else if userAdminMessage}<p class="form-success">{userAdminMessage}</p>{/if}
@@ -1190,7 +1243,7 @@
               <div class="user-edit-grid">
                 <label>昵称<input bind:value={user.displayName} /></label>
                 <label>用户组<select bind:value={user.groupId}>{#each userGroups as group}<option value={group.id}>{group.name}</option>{/each}</select></label>
-                <label>状态<select bind:value={user.status}><option value="active">active</option><option value="disabled">disabled</option><option value="banned">banned</option></select></label>
+                <label>状态<select bind:value={user.status}><option value="active">正常</option><option value="disabled">停用</option><option value="banned">封禁</option></select></label>
               </div>
               <div class="resource-actions">
                 <button class="button primary compact" type="button" on:click={() => saveManagedUser(user)}>保存</button>
@@ -1201,7 +1254,7 @@
           {/each}
         </div>
       {:else if isStoragePage}
-        <div class="section-heading"><p class="eyebrow">Storage</p><h2>存储设置</h2><p>配置本机、S3 兼容和 WebDAV 存储，切换默认上传目标，并对远端做健康检查。</p></div>
+        <div class="section-heading"><p class="eyebrow">存储配置</p><h2>存储设置</h2><p>配置本机、S3 兼容和 WebDAV 存储，切换默认上传目标，并对远端做健康检查。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         {#if storageError}<p class="form-error">{storageError}</p>{:else if storageMessage}<p class="form-success">{storageMessage}</p>{/if}
         {#if storageHealthResult}<p class="form-success">{storageHealthResult}</p>{/if}
@@ -1240,7 +1293,7 @@
           {/each}
         </div>
       {:else if isSiteSettingsPage}
-        <div class="section-heading"><p class="eyebrow">Site Settings</p><h2>站点设置</h2><p>配置站点名称、主页模块、游客上传开关和新上传资源的外链域名。</p></div>
+        <div class="section-heading"><p class="eyebrow">站点配置</p><h2>站点设置</h2><p>配置站点名称、主页模块、游客上传开关和新上传资源的外链域名。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         <article class="detail-panel site-settings-panel">
           <div class="resource-filter-grid">
@@ -1259,7 +1312,7 @@
           </div>
         </article>
       {:else if isFeaturedAdminPage}
-        <div class="section-heading"><p class="eyebrow">Featured Resources</p><h2>精选管理</h2><p>把资源加入探索广场，调整顺序，并控制首页展示的精选内容。</p></div>
+        <div class="section-heading"><p class="eyebrow">精选资源</p><h2>精选管理</h2><p>把资源加入探索广场，调整顺序，并控制首页展示的精选内容。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         {#if featuredError}<p class="form-error">{featuredError}</p>{:else if featuredMessage}<p class="form-success">{featuredMessage}</p>{/if}
         <section class="detail-panel">
@@ -1293,7 +1346,7 @@
         </section>
         <section class="detail-panel">
           <div class="subsection-heading"><h3>可加入精选的资源</h3><p>从现有资源中挑选要公开展示的内容。</p></div>
-          <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{option}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
+          <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{resourceTypeLabel(option)}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
           <div class="resource-list">
             {#if resources.length === 0}
               <p>当前没有可管理的资源。</p>
@@ -1327,9 +1380,9 @@
           {#if resourceTotalPages > 1}<nav class="pagination" aria-label="精选资源分页"><button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage - 1)} disabled={resourcePage <= 1}>上一页</button>{#each pageRange() as pageNumber}<button class:active-page={pageNumber === resourcePage} class="button ghost compact" type="button" on:click={() => changeResourcePage(pageNumber)}>{pageNumber}</button>{/each}<button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage + 1)} disabled={resourcePage >= resourceTotalPages}>下一页</button></nav>{/if}
         </section>
       {:else if isResourcePage}
-        <div class="section-heading"><p class="eyebrow">Resource Registry</p><h2>资源管理</h2><p>支持搜索、筛选、分页、软删除、恢复和详情查看。</p></div>
+        <div class="section-heading"><p class="eyebrow">资源库</p><h2>资源管理</h2><p>支持搜索、筛选、分页、软删除、恢复和详情查看。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
-        <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{option}</option>{/each}</select></label><label>状态<select bind:value={resourceFilters.status}><option value="active">正常</option><option value="deleted">已删除</option><option value="all">全部</option></select></label><label>用户组<select bind:value={resourceFilters.userGroup}><option value="">全部</option>{#each groupOptions as option}<option value={option}>{option}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
+        <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{resourceTypeLabel(option)}</option>{/each}</select></label><label>状态<select bind:value={resourceFilters.status}><option value="active">正常</option><option value="deleted">已删除</option><option value="all">全部</option></select></label><label>用户组<select bind:value={resourceFilters.userGroup}><option value="">全部</option>{#each groupOptions as option}<option value={option}>{groupLabel(option)}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
         {#if resourceError}<p class="form-error">{resourceError}</p>{/if}
         <div class="resource-toolbar"><span>共 {resourceTotal} 条资源</span><button class="button secondary compact" type="button" on:click={() => loadResources(resourcePage)} disabled={isLoadingResources}>{isLoadingResources ? '刷新中' : '刷新'}</button></div>
         <div class="resource-list" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
@@ -1344,7 +1397,7 @@
     <section class="glass-panel page-panel">
       <div class="panel-head">
         <div>
-          <p class="eyebrow">Explore Plaza</p>
+          <p class="eyebrow">探索广场</p>
           <h1>探索广场</h1>
           <p class="lead compact">公开展示管理员精选的静态资源。图片直接预览，非图片展示类型和大小。</p>
         </div>
@@ -1387,7 +1440,7 @@
   <main class="home-shell">
     <section class:single-panel={!siteSettings.showStatsOnHome} class="home-stage">
       <div class="home-copy">
-        <p class="eyebrow">Machring Static Hosting</p>
+        <p class="eyebrow">马赫环静态托管</p>
         <h1>{siteName}</h1>
         <p class="lead">统一托管图片、脚本、压缩包、可执行文件与其他静态资源，首页统计直接读取真实资源与流量数据。</p>
         <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}{#if !currentUser || currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>后台</a>{/if}{:else}<a class="button primary" href="/install">初始化</a>{/if}</div>
