@@ -255,6 +255,9 @@ type copyPolicyGroupRequest struct {
 }
 
 func (api *API) policyGroups(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
 	groups, err := api.app.PolicyStore.PolicyGroups(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to load policy groups", err))
@@ -273,6 +276,9 @@ func (api *API) policyGroups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) policyGroupDetail(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
 	group, rules, err := api.app.PolicyStore.PolicyGroup(r.Context(), r.PathValue("id"))
 	if errors.Is(err, policy.ErrPolicyGroupNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "policy group not found"})
@@ -1233,6 +1239,9 @@ func (api *API) reorderFeaturedResources(w http.ResponseWriter, r *http.Request)
 }
 
 func (api *API) resources(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
 	params := resource.ListParams{
 		Page:      parseIntDefault(r.URL.Query().Get("page"), 1),
 		PageSize:  parseIntDefault(r.URL.Query().Get("pageSize"), 20),
@@ -1279,6 +1288,9 @@ func (api *API) resources(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *API) resourceDetail(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
 	detail, err := api.app.Data.ResourceDetail(r.Context(), r.PathValue("id"))
 	if errors.Is(err, persist.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "resource not found"})

@@ -1,21 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  const path = window.location.pathname;
-  const parts = path.split('/').filter(Boolean);
-  const resourceDetailId = parts[0] === 'admin' && parts[1] === 'resources' && parts[2] ? decodeURIComponent(parts[2]) : '';
-  const isDashboardPage = path === '/admin' || path === '/admin/dashboard';
-  const isPolicyPage = path === '/admin/policies';
-  const isResourcePage = path === '/admin/resources';
-  const isResourceDetailPage = resourceDetailId !== '';
-  const isUserGroupPage = path === '/admin/user-groups';
-  const isUserPage = path === '/admin/users';
-  const isStoragePage = path === '/admin/storage';
-  const isSiteSettingsPage = path === '/admin/site';
-  const isFeaturedAdminPage = path === '/admin/featured';
-  const isExplorePage = path === '/explore';
-  const isAdminPage = isDashboardPage || isPolicyPage || isResourcePage || isResourceDetailPage || isUserGroupPage || isUserPage || isStoragePage || isSiteSettingsPage || isFeaturedAdminPage;
-  const isAccountPage = path === '/account';
+  let path = window.location.pathname;
+  let parts: string[] = [];
+  let resourceDetailId = '';
+  let isDashboardPage = false;
+  let isPolicyPage = false;
+  let isResourcePage = false;
+  let isResourceDetailPage = false;
+  let isUserGroupPage = false;
+  let isUserPage = false;
+  let isStoragePage = false;
+  let isSiteSettingsPage = false;
+  let isFeaturedAdminPage = false;
+  let isExplorePage = false;
+  let isAdminPage = false;
+  let isAccountPage = false;
 
   type AuthUser = { id: string; username: string; displayName: string; role: string; groupId: string; groupName: string; status: string };
   type InstallState = { initialized: boolean; siteName: string; defaultStorage: string; adminUsername: string };
@@ -120,36 +120,89 @@
   let siteSettingsMessage = '';
   let featuredError = '';
   let featuredMessage = '';
+  let routeLoadToken = 0;
+
+  $: parts = path.split('/').filter(Boolean);
+  $: resourceDetailId = parts[0] === 'admin' && parts[1] === 'resources' && parts[2] ? decodeURIComponent(parts[2]) : '';
+  $: isDashboardPage = path === '/admin' || path === '/admin/dashboard';
+  $: isPolicyPage = path === '/admin/policies';
+  $: isResourcePage = path === '/admin/resources';
+  $: isResourceDetailPage = resourceDetailId !== '';
+  $: isUserGroupPage = path === '/admin/user-groups';
+  $: isUserPage = path === '/admin/users';
+  $: isStoragePage = path === '/admin/storage';
+  $: isSiteSettingsPage = path === '/admin/site';
+  $: isFeaturedAdminPage = path === '/admin/featured';
+  $: isExplorePage = path === '/explore';
+  $: isAdminPage = isDashboardPage || isPolicyPage || isResourcePage || isResourceDetailPage || isUserGroupPage || isUserPage || isStoragePage || isSiteSettingsPage || isFeaturedAdminPage;
+  $: isAccountPage = path === '/account';
 
   $: uploadGroup = currentUser?.groupId ?? 'guest';
 
-  onMount(async () => {
-    await loadInstallState();
-    await loadSiteSettings(true);
-    await loadHomeStats();
-    await loadFeaturedResources(true);
-    if (!installState?.initialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) return jump('/install');
-    if (installState?.initialized && path === '/install') return jump('/admin');
-    await loadCurrentUser();
-    if ((path === '/login' || path === '/install') && currentUser) return jump('/admin');
-    if (path === '/upload' || isAccountPage) await loadAccountUsage();
-    if (currentUser && isAdminPage) {
-      if (isDashboardPage) await loadDashboardData();
-      if (isPolicyPage) {
-        await loadPolicyGroups();
-        await loadPolicies();
-      }
-      if (isUserGroupPage) await loadUserGroups();
-      if (isUserPage) await loadUserAdminData();
-      if (isStoragePage) await loadStorageConfigs();
-      if (isSiteSettingsPage) await loadSiteSettings();
-      if (isFeaturedAdminPage) await Promise.all([loadResources(), loadFeaturedResources()]);
-      if (isResourcePage) await loadResources();
-      if (isResourceDetailPage) await loadResourceDetail(resourceDetailId);
-    }
+  onMount(() => {
+    const handlePopState = () => {
+      path = window.location.pathname;
+      void handleRouteChange();
+    };
+    window.addEventListener('popstate', handlePopState);
+    void (async () => {
+      await Promise.all([loadInstallState(), loadSiteSettings(true)]);
+      await loadCurrentUser();
+      await handleRouteChange();
+    })();
+    return () => window.removeEventListener('popstate', handlePopState);
   });
 
-  function jump(url: string) { window.location.href = url; }
+  async function navigate(url: string, replace = false) {
+    if (url === path) return;
+    window.history[replace ? 'replaceState' : 'pushState']({}, '', url);
+    path = window.location.pathname;
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    await handleRouteChange();
+  }
+
+  function jump(url: string) { void navigate(url); }
+
+  async function handleRouteChange() {
+    const token = ++routeLoadToken;
+
+    if (!installState?.initialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) {
+      await navigate('/install', true);
+      return;
+    }
+    if (installState?.initialized && path === '/install') {
+      await navigate(currentUser ? (currentUser.role === 'admin' ? '/admin' : '/account') : '/login', true);
+      return;
+    }
+    if ((path === '/login' || path === '/install') && currentUser) {
+      await navigate(currentUser.role === 'admin' ? '/admin' : '/account', true);
+      return;
+    }
+    if (isAdminPage && authReady && (!currentUser || currentUser.role !== 'admin')) {
+      await navigate(currentUser ? '/account' : '/login', true);
+      return;
+    }
+
+    const tasks: Promise<unknown>[] = [];
+    if (path === '/' || isDashboardPage) tasks.push(loadHomeStats());
+    if (path === '/' || isExplorePage || isFeaturedAdminPage) tasks.push(loadFeaturedResources(true));
+    if (path === '/upload' || isAccountPage) tasks.push(loadAccountUsage());
+
+    if (currentUser?.role === 'admin' && isAdminPage) {
+      if (isDashboardPage) tasks.push(loadDashboardData());
+      if (isPolicyPage) tasks.push(loadPolicyEditor());
+      if (isUserGroupPage) tasks.push(loadUserGroups());
+      if (isUserPage) tasks.push(loadUserAdminData());
+      if (isStoragePage) tasks.push(loadStorageConfigs());
+      if (isSiteSettingsPage) tasks.push(loadSiteSettings());
+      if (isFeaturedAdminPage) tasks.push(loadResources());
+      if (isResourcePage) tasks.push(loadResources());
+      if (isResourceDetailPage) tasks.push(loadResourceDetail(resourceDetailId));
+    }
+
+    await Promise.all(tasks);
+    if (token !== routeLoadToken) return;
+  }
   async function loadInstallState() { try { const res = await fetch('/api/v1/install/state'); if (!res.ok) return; const payload = await res.json() as InstallState; installState = payload; siteName = payload.siteName || siteName; installForm.siteName = payload.siteName || installForm.siteName; installForm.defaultStorage = payload.defaultStorage || installForm.defaultStorage; if (payload.adminUsername) loginForm.username = payload.adminUsername; } finally { installReady = true; } }
   async function loadSiteSettings(silent = false) {
     if (!silent) {
@@ -243,7 +296,7 @@
       const payload = await res.json();
       if (!res.ok) return void (loginError = payload.error ?? '登录失败');
       currentUser = payload.user;
-      jump('/admin');
+      jump(payload.user?.role === 'admin' ? '/admin' : '/account');
     } catch (error) {
       loginError = error instanceof Error ? error.message : '登录失败';
     } finally {
@@ -334,15 +387,21 @@
 
   async function loadPolicyGroups() { policyGroupError = ''; try { const res = await fetch('/api/v1/policy-groups'); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '加载策略组失败'); policyGroups = payload.groups ?? []; activePolicyGroupId = payload.activeGroup?.id ?? ''; if (!selectedPolicyGroupId || !policyGroups.some((group) => group.id === selectedPolicyGroupId)) selectedPolicyGroupId = activePolicyGroupId || policyGroups[0]?.id || ''; } catch (error) { policyGroupError = error instanceof Error ? error.message : '加载策略组失败'; } }
   async function loadPolicies(groupId = selectedPolicyGroupId) { const resolved = groupId || activePolicyGroupId; if (!resolved) return; policySaveError = ''; policySaveMessage = ''; try { const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(resolved)}`); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.error ?? '加载策略失败'); selectedPolicyGroupId = payload.group?.id ?? resolved; rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); } catch (error) { policySaveError = error instanceof Error ? error.message : '加载策略失败'; } }
+  async function loadPolicyEditor(groupId = selectedPolicyGroupId) {
+    await loadPolicyGroups();
+    const resolved = groupId || selectedPolicyGroupId || activePolicyGroupId || policyGroups[0]?.id || '';
+    if (!resolved) return;
+    await loadPolicies(resolved);
+  }
   function syncMatrixFromRules(rules: PolicyRule[]) { const baseMap = new Map<string, PolicyRule>(); const overrides: PolicyRule[] = []; for (const rule of rules) { if (rule.extension) overrides.push({ ...rule }); else baseMap.set(`${rule.userGroup}|${rule.resourceType}`, { ...rule, extension: '' }); } matrixBaseRules = []; for (const group of groupOptions) for (const type of resourceTypeOptions) matrixBaseRules.push(baseMap.get(`${group}|${type}`) ?? emptyRule(group, type)); matrixOverrideRules = overrides; matrixError = ''; }
   function collectMatrixRules() { return [...matrixBaseRules, ...matrixOverrideRules].map((rule) => ({ ...rule, extension: (rule.extension ?? '').trim().replace(/^\./, '').toLowerCase(), cacheControl: (rule.cacheControl ?? '').trim(), downloadDisposition: (rule.downloadDisposition ?? '').trim() })).filter((rule) => rule.userGroup && rule.resourceType); }
   function validateMatrixRules(rules: PolicyRule[]) { const errors: string[] = []; const seen = new Set<string>(); for (const [index, rule] of rules.entries()) { const label = rule.extension ? `扩展规则 ${index + 1}` : `${rule.userGroup}/${rule.resourceType}`; if (!groupOptions.includes(rule.userGroup)) errors.push(`${label} 的用户组无效`); if (!resourceTypeOptions.includes(rule.resourceType)) errors.push(`${label} 的资源类型无效`); if (rule.extension && !/^[a-z0-9]+$/.test(rule.extension)) errors.push(`${label} 的扩展名只能包含小写字母和数字`); if (rule.maxFileSizeBytes < 0 || rule.monthlyTrafficPerResourceBytes < 0 || rule.monthlyTrafficPerUserAndTypeBytes < 0) errors.push(`${label} 的数值必须大于等于 0`); if (rule.downloadDisposition && rule.downloadDisposition !== 'inline' && rule.downloadDisposition !== 'attachment') errors.push(`${label} 的下载策略无效`); const key = `${rule.userGroup}|${rule.resourceType}|${rule.extension ?? ''}`; if (seen.has(key)) errors.push(`${label} 与其他规则重复`); seen.add(key); } return errors; }
   function addOverrideRule() { matrixOverrideRules = [...matrixOverrideRules, { ...emptyRule('guest', 'image'), extension: 'jpg', allowAccess: true }]; }
   function removeOverrideRule(index: number) { matrixOverrideRules = matrixOverrideRules.filter((_, current) => current !== index); }
   function applyAdvancedJson() { matrixError = ''; try { const parsed = JSON.parse(rulesJson); if (!Array.isArray(parsed)) return void (matrixError = '高级 JSON 必须是规则数组。'); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); syncMatrixFromRules(parsed); rulesJson = JSON.stringify(parsed, null, 2); } catch (error) { matrixError = error instanceof Error ? error.message : '高级 JSON 解析失败'; } }
-  async function createPolicyGroup() { policyGroupError = ''; if (!policyGroupForm.name.trim()) return void (policyGroupError = '请输入策略组名称。'); isCreatingPolicyGroup = true; try { const res = await fetch('/api/v1/policy-groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(policyGroupForm) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '创建策略组失败'); policyGroupForm = { name: '', description: '' }; await loadPolicyGroups(); selectedPolicyGroupId = payload.group.id; await loadPolicies(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '创建策略组失败'; } finally { isCreatingPolicyGroup = false; } }
-  async function copyPolicyGroup(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `${group.name} 副本` }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '复制策略组失败'); await loadPolicyGroups(); selectedPolicyGroupId = payload.group.id; await loadPolicies(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '复制策略组失败'; } }
-  async function setPolicyGroupActive(group: PolicyGroup, active: boolean) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '更新策略组状态失败'); await loadPolicyGroups(); await loadPolicies(selectedPolicyGroupId || payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '更新策略组状态失败'; } }
+  async function createPolicyGroup() { policyGroupError = ''; if (!policyGroupForm.name.trim()) return void (policyGroupError = '请输入策略组名称。'); isCreatingPolicyGroup = true; try { const res = await fetch('/api/v1/policy-groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(policyGroupForm) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '创建策略组失败'); policyGroupForm = { name: '', description: '' }; selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '创建策略组失败'; } finally { isCreatingPolicyGroup = false; } }
+  async function copyPolicyGroup(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `${group.name} 副本` }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '复制策略组失败'); selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '复制策略组失败'; } }
+  async function setPolicyGroupActive(group: PolicyGroup, active: boolean) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '更新策略组状态失败'); await loadPolicyEditor(selectedPolicyGroupId || payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '更新策略组状态失败'; } }
   async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policySaveMessage = '策略已保存。'; await loadPolicyGroups(); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
   async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: Number(policyForm.size) || 0 }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
   async function loadUserGroups(silent = false) { if (!silent) { userGroupError = ''; userGroupMessage = ''; } try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }
@@ -546,9 +605,6 @@
   async function copyText(value: string) { try { await navigator.clipboard.writeText(value); copyMessage = '已复制。'; setTimeout(() => { copyMessage = ''; }, 1600); } catch { copyMessage = '复制失败，请手动复制。'; } }
   function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = value; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`; }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
-  function chartPolyline(points: Array<{ label: string; bytes: number }>) { if (points.length === 0) return '10,88 90,88'; const max = Math.max(...points.map((point) => point.bytes), 1); return points.map((point, index) => { const x = 10 + (80 / Math.max(points.length - 1, 1)) * index; const y = 86 - (point.bytes / max) * 58; return `${x},${y}`; }).join(' '); }
-  function pointX(index: number, length: number) { return 10 + (80 / Math.max(length - 1, 1)) * index; }
-  function pointY(value: number, max: number) { return 86 - (value / Math.max(max, 1)) * 58; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
   function resourceBadge(record: ResourceRecord) { return `${record.type} · ${formatBytes(record.size)} · ${record.isPrivate ? '私有' : '公开'} · ${record.status === 'deleted' ? '已删除' : '正常'}`; }
   function securityHint(record: ResourceRecord) { if (record.isPrivate) return '私有资源默认拒绝匿名直链访问，可使用签名链接按时效开放。'; if (record.type === 'image') return '图片资源可直接预览。'; if (record.type === 'script' || record.type === 'executable') return '脚本和可执行资源会强制下载，避免浏览器直接执行。'; return '非图片资源展示类型、大小、下载策略和安全提示。'; }
@@ -691,17 +747,17 @@
             <div><dt>用户组</dt><dd>{accountUsage.group.name}</dd></div>
             <div><dt>外链权限</dt><dd>{accountUsage.group.allowHotlink ? '允许' : '禁止匿名外链'}</dd></div>
           </dl>
-          <div class="actions">
-            <a class="button primary" href="/upload">继续上传</a>
-            {#if currentUser.role === 'admin'}<a class="button secondary" href="/admin">进入后台</a>{/if}
-          </div>
+        <div class="actions">
+          <a class="button primary" href="/upload">继续上传</a>
+            {#if currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>进入后台</a>{/if}
+        </div>
         {/if}
       {/if}
     </section>
   </main>
 {:else if path === '/login'}
   <main class="page-shell narrow">
-    <a class="back-link" href="/">返回首页</a>
+    <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
       <p class="eyebrow">Machring Static Hosting</p>
       <h1>登录</h1>
@@ -714,22 +770,39 @@
     </section>
   </main>
 {:else if isAdminPage}
+  {#if !authReady}
+  <main class="page-shell narrow">
+    <section class="glass-panel page-panel">
+      <p class="eyebrow">Machring Admin</p>
+      <h1>正在检查登录状态</h1>
+      <p class="lead compact">正在确认管理员会话。</p>
+    </section>
+  </main>
+  {:else if !currentUser}
+  <main class="page-shell narrow">
+    <section class="glass-panel page-panel">
+      <p class="eyebrow">Machring Admin</p>
+      <h1>需要管理员登录</h1>
+      <p class="lead compact">正在跳转到登录页。</p>
+    </section>
+  </main>
+  {:else}
   <main class="admin-shell">
     <aside class="admin-sidebar glass-panel" aria-label="后台导航">
-      <a class="back-link" href="/">返回首页</a>
+      <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
       <p class="eyebrow">Machring Admin</p>
       <h1>后台</h1>
       <nav class="admin-nav" aria-label="后台功能">
-        <a class:active={isDashboardPage} class="admin-nav-link" href="/admin">仪表盘</a>
-        <a class:active={isPolicyPage} class="admin-nav-link" href="/admin/policies">策略组</a>
-        <a class:active={isUserGroupPage} class="admin-nav-link" href="/admin/user-groups">用户组</a>
-        <a class:active={isUserPage} class="admin-nav-link" href="/admin/users">用户管理</a>
-        <a class:active={isStoragePage} class="admin-nav-link" href="/admin/storage">存储设置</a>
-        <a class:active={isSiteSettingsPage} class="admin-nav-link" href="/admin/site">站点设置</a>
-        <a class:active={isFeaturedAdminPage} class="admin-nav-link" href="/admin/featured">精选管理</a>
-        <a class:active={isResourcePage || isResourceDetailPage} class="admin-nav-link" href="/admin/resources">资源管理</a>
+        <a class:active={isDashboardPage} class="admin-nav-link" href="/admin" on:click|preventDefault={() => navigate('/admin')}>仪表盘</a>
+        <a class:active={isPolicyPage} class="admin-nav-link" href="/admin/policies" on:click|preventDefault={() => navigate('/admin/policies')}>策略组</a>
+        <a class:active={isUserGroupPage} class="admin-nav-link" href="/admin/user-groups" on:click|preventDefault={() => navigate('/admin/user-groups')}>用户组</a>
+        <a class:active={isUserPage} class="admin-nav-link" href="/admin/users" on:click|preventDefault={() => navigate('/admin/users')}>用户管理</a>
+        <a class:active={isStoragePage} class="admin-nav-link" href="/admin/storage" on:click|preventDefault={() => navigate('/admin/storage')}>存储设置</a>
+        <a class:active={isSiteSettingsPage} class="admin-nav-link" href="/admin/site" on:click|preventDefault={() => navigate('/admin/site')}>站点设置</a>
+        <a class:active={isFeaturedAdminPage} class="admin-nav-link" href="/admin/featured" on:click|preventDefault={() => navigate('/admin/featured')}>精选管理</a>
+        <a class:active={isResourcePage || isResourceDetailPage} class="admin-nav-link" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>资源管理</a>
       </nav>
-      {#if currentUser}<div class="sidebar-meta"><p>{currentUser.displayName}</p><span>{currentUser.groupName}</span></div><button class="button secondary" type="button" on:click={logout}>退出登录</button>{/if}
+      <div class="sidebar-meta"><p>{currentUser.displayName}</p><span>{currentUser.groupName}</span></div><button class="button secondary" type="button" on:click={logout}>退出登录</button>
     </aside>
     <section class="admin-workspace glass-panel">
       {#if isDashboardPage}
@@ -752,7 +825,7 @@
         </div>
       {:else if isPolicyPage}
         <div class="section-heading"><p class="eyebrow">Policy Groups</p><h2>策略组</h2><p>复制、启用、停用不同策略组，并对选中策略组直接编辑规则。</p></div>
-        <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
+        <div class="admin-session"><span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span></div>
         <div class="policy-groups-layout">
           <section class="policy-groups-panel">
             <div class="subsection-heading"><h3>策略组列表</h3><p>上传和访问始终使用当前启用的策略组。</p></div>
@@ -762,16 +835,25 @@
               <button class="button secondary" type="submit" disabled={isCreatingPolicyGroup || !currentUser}>{isCreatingPolicyGroup ? '创建中' : '新建策略组'}</button>
             </form>
             {#if policyGroupError}<p class="form-error">{policyGroupError}</p>{/if}
-            <div class="policy-group-list">{#each policyGroups as item}<article class:selected={item.id === selectedPolicyGroupId} class="policy-group-card"><button class="policy-group-select" type="button" on:click={() => loadPolicies(item.id)}><strong>{item.name}</strong><span>{item.isActive ? '已启用' : '未启用'}{item.isDefault ? ' · 默认' : ''}</span></button><p>{item.description || '暂无说明'}</p><div class="policy-group-actions"><button class="button secondary compact" type="button" on:click={() => copyPolicyGroup(item)} disabled={!currentUser}>复制</button>{#if item.isActive}<button class="button secondary compact" type="button" on:click={() => setPolicyGroupActive(item, false)} disabled={!currentUser}>停用</button>{:else}<button class="button primary compact" type="button" on:click={() => setPolicyGroupActive(item, true)} disabled={!currentUser}>启用</button>{/if}</div></article>{/each}</div>
+            <div class="policy-group-list">{#each policyGroups as item}<article class:selected={item.id === selectedPolicyGroupId} class="policy-group-card"><button class="policy-group-select" type="button" on:click={() => loadPolicyEditor(item.id)}><strong>{item.name}</strong><span>{item.isActive ? '已启用' : '未启用'}{item.isDefault ? ' · 默认' : ''}</span></button><p>{item.description || '暂无说明'}</p><div class="policy-group-actions"><button class="button secondary compact" type="button" on:click={() => copyPolicyGroup(item)} disabled={!currentUser}>复制</button>{#if item.isActive}<button class="button secondary compact" type="button" on:click={() => setPolicyGroupActive(item, false)} disabled={!currentUser}>停用</button>{:else}<button class="button primary compact" type="button" on:click={() => setPolicyGroupActive(item, true)} disabled={!currentUser}>启用</button>{/if}</div></article>{/each}</div>
           </section>
           <section class="policy-editor-panel">
             <div class="subsection-heading"><h3>规则编辑</h3><p>当前编辑：{policyGroups.find((group) => group.id === selectedPolicyGroupId)?.name ?? '未选择策略组'}</p></div>
+            <div class="policy-editor-toolbar">
+              <div class="policy-editor-meta">
+                <strong>{policyGroups.find((group) => group.id === selectedPolicyGroupId)?.name ?? '未选择策略组'}</strong>
+                <span>基础规则 {matrixBaseRules.length} 条 · 覆盖规则 {matrixOverrideRules.length} 条</span>
+              </div>
+              <div class="policy-editor-actions">
+                <button class="button ghost compact" type="button" disabled={!selectedPolicyGroupId} on:click={() => loadPolicyEditor(selectedPolicyGroupId)}>刷新</button>
+                <button class="button primary" type="button" disabled={isSavingPolicies || !currentUser || !selectedPolicyGroupId} on:click={savePolicies}>{isSavingPolicies ? '保存中' : '保存策略'}</button>
+              </div>
+            </div>
             <div class="matrix-block"><table class="policy-matrix-table"><thead><tr><th>用户组</th><th>资源类型</th><th>上传</th><th>访问</th><th>单文件</th><th>月流量</th><th>下载</th><th>缓存</th></tr></thead><tbody>{#each matrixBaseRules as rule, index}<tr><td>{rule.userGroup}</td><td>{rule.resourceType}</td><td><input aria-label={`allow upload ${index}`} type="checkbox" bind:checked={rule.allowUpload} /></td><td><input aria-label={`allow access ${index}`} type="checkbox" bind:checked={rule.allowAccess} /></td><td><input aria-label={`max file ${index}`} type="number" min="0" bind:value={rule.maxFileSizeBytes} /></td><td><input aria-label={`monthly traffic ${index}`} type="number" min="0" bind:value={rule.monthlyTrafficPerResourceBytes} /></td><td><select aria-label={`disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">inline</option><option value="attachment">attachment</option></select></td><td><input aria-label={`cache ${index}`} bind:value={rule.cacheControl} placeholder="public, max-age=31536000" /></td></tr>{/each}</tbody></table></div>
             <div class="override-panel"><div class="subsection-heading"><h3>扩展名覆盖</h3><p>用于按扩展名覆盖同类资源的默认规则。</p></div><button class="button secondary compact" type="button" on:click={addOverrideRule}>添加覆盖规则</button><div class="override-list">{#each matrixOverrideRules as rule, index}<div class="override-row"><input aria-label={`override group ${index}`} bind:value={rule.userGroup} list="group-options" /><input aria-label={`override type ${index}`} bind:value={rule.resourceType} list="resource-type-options" /><input aria-label={`override ext ${index}`} bind:value={rule.extension} placeholder="jpg" /><label><span>上传</span><input type="checkbox" bind:checked={rule.allowUpload} /></label><label><span>访问</span><input type="checkbox" bind:checked={rule.allowAccess} /></label><input aria-label={`override max ${index}`} type="number" min="0" bind:value={rule.maxFileSizeBytes} /><input aria-label={`override monthly ${index}`} type="number" min="0" bind:value={rule.monthlyTrafficPerResourceBytes} /><select aria-label={`override disposition ${index}`} bind:value={rule.downloadDisposition}><option value="">inline</option><option value="attachment">attachment</option></select><button class="button ghost compact" type="button" on:click={() => removeOverrideRule(index)}>移除</button></div>{/each}</div><datalist id="group-options">{#each groupOptions as option}<option value={option}></option>{/each}</datalist><datalist id="resource-type-options">{#each resourceTypeOptions as option}<option value={option}></option>{/each}</datalist></div>
             {#if matrixError}<p class="form-error">{matrixError}</p>{/if}
             {#if policySaveError}<p class="form-error">{policySaveError}</p>{:else if policySaveMessage}<p class="form-success">{policySaveMessage}</p>{/if}
             <details class="policy-json-details"><summary>高级 JSON</summary><textarea bind:value={rulesJson} rows="12" spellcheck="false"></textarea><button class="button secondary compact" type="button" on:click={applyAdvancedJson}>应用 JSON</button></details>
-            <button class="button secondary" type="button" disabled={isSavingPolicies || !currentUser || !selectedPolicyGroupId} on:click={savePolicies}>{isSavingPolicies ? '保存中' : '保存策略'}</button>
           </section>
         </div>
         <div class="policy-test-section"><div class="subsection-heading"><h3>策略测试</h3><p>测试结果会显示当前命中的启用策略组。</p></div><form class="policy-test-form" on:submit|preventDefault={runPolicyTest}><label>动作<select bind:value={policyForm.action}><option value="upload">上传</option><option value="access">访问</option></select></label><label>用户组<select bind:value={policyForm.group}><option value="guest">游客</option><option value="user">登录用户</option><option value="admin">管理员</option></select></label><label>文件名<input bind:value={policyForm.filename} placeholder="demo.jpg" /></label><label>MIME<input bind:value={policyForm.contentType} placeholder="image/jpeg" /></label><label>文件大小<input bind:value={policyForm.size} min="0" type="number" /></label><button class="button primary" type="submit" disabled={isTestingPolicy || !currentUser}>{isTestingPolicy ? '测试中' : '测试策略'}</button></form><div class="policy-outcome" aria-live="polite">{#if policyError}<p class="result-state denied">测试失败</p><p>{policyError}</p>{:else if policyResult}<p class:allowed={policyResult.decision.allowed} class:denied={!policyResult.decision.allowed} class="result-state">{policyResult.decision.allowed ? '允许' : '拒绝'}</p><dl class="result-list"><div><dt>命中策略组</dt><dd>{policyResult.policyGroup.name}</dd></div><div><dt>原因</dt><dd>{policyResult.decision.reason}</dd></div><div><dt>资源类型</dt><dd>{policyResult.metadata.type}</dd></div><div><dt>扩展名</dt><dd>{policyResult.metadata.extension || '无'}</dd></div><div><dt>命中用户组</dt><dd>{policyResult.decision.rule.userGroup || '无'}</dd></div><div><dt>单文件限制</dt><dd>{formatBytes(policyResult.decision.rule.maxFileSizeBytes)}</dd></div><div><dt>单资源月流量</dt><dd>{formatBytes(policyResult.decision.rule.monthlyTrafficPerResourceBytes)}</dd></div><div><dt>下载策略</dt><dd>{policyResult.decision.rule.downloadDisposition || 'inline'}</dd></div></dl>{:else}<p class="result-state">等待测试</p><p>示例默认按游客上传 1 MB JPG 资源。</p>{/if}</div></div>
@@ -944,7 +1026,7 @@
                     {:else}
                       <button class="button primary compact" type="button" on:click={() => addFeatured(item)}>加入精选</button>
                     {/if}
-                    <a class="button secondary compact" href={`/admin/resources/${item.id}`}>查看详情</a>
+                    <a class="button secondary compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>查看详情</a>
                   </div>
                 </article>
               {/each}
@@ -958,11 +1040,11 @@
         <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{option}</option>{/each}</select></label><label>状态<select bind:value={resourceFilters.status}><option value="active">正常</option><option value="deleted">已删除</option><option value="all">全部</option></select></label><label>用户组<select bind:value={resourceFilters.userGroup}><option value="">全部</option>{#each groupOptions as option}<option value={option}>{option}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
         {#if resourceError}<p class="form-error">{resourceError}</p>{/if}
         <div class="resource-toolbar"><span>共 {resourceTotal} 条资源</span><button class="button secondary compact" type="button" on:click={() => loadResources(resourcePage)} disabled={isLoadingResources}>{isLoadingResources ? '刷新中' : '刷新'}</button></div>
-        <div class="resource-list" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
+        <div class="resource-list" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
         {#if resourceTotalPages > 1}<nav class="pagination" aria-label="资源分页"><button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage - 1)} disabled={resourcePage <= 1}>上一页</button>{#each pageRange() as pageNumber}<button class:active-page={pageNumber === resourcePage} class="button ghost compact" type="button" on:click={() => changeResourcePage(pageNumber)}>{pageNumber}</button>{/each}<button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage + 1)} disabled={resourcePage >= resourceTotalPages}>下一页</button></nav>{/if}
       {:else}
         <div class="section-heading"><p class="eyebrow">Resource Detail</p><h2>资源详情</h2><p>查看资源元数据、预览、全部外链格式、流量窗口和审计信息。</p></div>
-        <div class="resource-detail-toolbar"><a class="button ghost compact" href="/admin/resources">返回资源列表</a>{#if resourceDetail && copyMessage}<span class="form-success">{copyMessage}</span>{/if}</div>
+        <div class="resource-detail-toolbar"><a class="button ghost compact" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>返回资源列表</a>{#if resourceDetail && copyMessage}<span class="form-success">{copyMessage}</span>{/if}</div>
         {#if detailError}
           <p class="form-error">{detailError}</p>
         {:else if isLoadingDetail || !resourceDetail}
@@ -1043,6 +1125,7 @@
       {/if}
     </section>
   </main>
+  {/if}
 {:else if isExplorePage}
   <main class="page-shell wide">
     <a class="back-link" href="/">返回首页</a>
@@ -1095,7 +1178,7 @@
         <p class="eyebrow">Machring Static Hosting</p>
         <h1>{siteName}</h1>
         <p class="lead">统一托管图片、脚本、压缩包、可执行文件与其他静态资源，首页统计直接读取真实资源与流量数据。</p>
-        <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}<a class="button secondary" href="/admin">后台</a>{:else}<a class="button primary" href="/install">初始化</a>{/if}</div>
+        <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}{#if !currentUser || currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>后台</a>{/if}{:else}<a class="button primary" href="/install">初始化</a>{/if}</div>
       </div>
       {#if siteSettings.showStatsOnHome}
         <div class="hero-stats">
@@ -1104,15 +1187,6 @@
             <article class="metric-card glass-panel"><span>累计存储</span><strong>{formatBytes(homeStats.totalStorageBytes)}</strong><small>当前有效资源占用</small></article>
             <article class="metric-card glass-panel"><span>累计流量</span><strong>{formatBytes(homeStats.totalTrafficBytes)}</strong><small>所有资源历史访问总量</small></article>
             <article class="metric-card glass-panel"><span>今日上传</span><strong>{homeStats.todayUploads}</strong><small>实时刷新</small></article>
-          </div>
-          <div class="traffic-card glass-panel">
-            <div class="traffic-head"><span>近七日流量</span><strong>{formatBytes(homeStats.recentTraffic.reduce((sum, point) => sum + point.bytes, 0))}</strong></div>
-            {#if homeStatsReady}
-              <svg class="traffic-chart" viewBox="0 0 100 100" role="img" aria-label="近七日流量趋势"><path d="M10 86H94" class="axis" /><polyline points={chartPolyline(homeStats.recentTraffic)} class="line" />{#each homeStats.recentTraffic as point, index}<circle class="dot" cx={pointX(index, homeStats.recentTraffic.length)} cy={pointY(point.bytes, Math.max(...homeStats.recentTraffic.map((item) => item.bytes), 1))} r="1.8" />{/each}</svg>
-              <div class="chart-labels">{#each homeStats.recentTraffic as point}<span>{point.label}</span>{/each}</div>
-            {:else}
-              <p class="lead compact">统计加载中…</p>
-            {/if}
           </div>
         </div>
       {/if}

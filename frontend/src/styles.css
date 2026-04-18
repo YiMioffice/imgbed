@@ -630,8 +630,9 @@ textarea:focus-visible,
 
 .policy-groups-layout {
   display: grid;
-  grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.05fr);
-  gap: 20px;
+  grid-template-columns: minmax(320px, 360px) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
   margin-top: 28px;
 }
 
@@ -639,6 +640,12 @@ textarea:focus-visible,
 .policy-editor-panel,
 .policy-test-section {
   min-width: 0;
+}
+
+.policy-editor-panel {
+  display: grid;
+  gap: 16px;
+  align-content: start;
 }
 
 .policy-group-create {
@@ -705,15 +712,56 @@ textarea:focus-visible,
   padding-top: 24px;
 }
 
+.policy-editor-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid rgba(16, 20, 19, 0.12);
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: rgba(246, 249, 247, 0.92);
+  backdrop-filter: blur(12px);
+}
+
+.policy-editor-meta {
+  display: grid;
+  gap: 4px;
+}
+
+.policy-editor-meta strong {
+  color: #18211e;
+  font-size: 1rem;
+}
+
+.policy-editor-meta span {
+  color: #465452;
+  font-size: 0.92rem;
+  font-weight: 760;
+}
+
+.policy-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .matrix-block {
   overflow-x: auto;
+  border: 1px solid rgba(16, 20, 19, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.3);
 }
 
 .policy-matrix-table {
   width: 100%;
+  min-width: 940px;
   border-collapse: collapse;
-  margin-top: 18px;
-  background: rgba(255, 255, 255, 0.3);
+  background: transparent;
 }
 
 .policy-matrix-table th,
@@ -725,13 +773,26 @@ textarea:focus-visible,
 }
 
 .policy-matrix-table th {
+  position: sticky;
+  top: 0;
+  background: rgba(244, 248, 245, 0.96);
   color: #23302c;
   font-size: 0.9rem;
+  white-space: nowrap;
 }
 
 .policy-matrix-table td input,
 .policy-matrix-table td select {
   min-height: 40px;
+}
+
+.policy-matrix-table td input[type='number'],
+.policy-matrix-table td select {
+  min-width: 96px;
+}
+
+.policy-matrix-table td:last-child input {
+  min-width: 220px;
 }
 
 .override-panel {
@@ -747,7 +808,7 @@ textarea:focus-visible,
 
 .override-row {
   display: grid;
-  grid-template-columns: repeat(8, minmax(0, 1fr)) auto;
+  grid-template-columns: repeat(3, minmax(120px, 1fr)) repeat(2, max-content) repeat(2, minmax(110px, 0.9fr)) minmax(120px, 0.9fr) auto;
   gap: 10px;
   align-items: center;
   border: 1px solid rgba(16, 20, 19, 0.12);
@@ -1326,6 +1387,11 @@ textarea {
   }
 
   .resource-toolbar {
+    justify-content: stretch;
+  }
+
+  .policy-editor-toolbar,
+  .policy-editor-actions {
     justify-content: stretch;
   }
 }

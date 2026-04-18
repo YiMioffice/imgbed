@@ -101,6 +101,37 @@ func TestPolicyTestEndpointRequiresAdmin(t *testing.T) {
 	}
 }
 
+func TestPolicyGroupsRequireAdmin(t *testing.T) {
+	api := testAPI(t, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/policy-groups", nil)
+	rec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusUnauthorized, rec.Body.String())
+	}
+}
+
+func TestResourcesRequireAdmin(t *testing.T) {
+	api := testAPI(t, true)
+	resourceID := uploadTestPNG(t, api)
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources", nil)
+	listRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusUnauthorized {
+		t.Fatalf("list status = %d, want %d; body: %s", listRec.Code, http.StatusUnauthorized, listRec.Body.String())
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	detailRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusUnauthorized {
+		t.Fatalf("detail status = %d, want %d; body: %s", detailRec.Code, http.StatusUnauthorized, detailRec.Body.String())
+	}
+}
+
 func TestLoginAndMe(t *testing.T) {
 	api := testAPI(t, true)
 
@@ -190,6 +221,7 @@ func TestUploadCreatesResourceAndServesDirectLink(t *testing.T) {
 	}
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+uploadResponse.Resource.ID, nil)
+	addAdminCookie(t, api, detailReq)
 	detailRec := httptest.NewRecorder()
 	api.Routes().ServeHTTP(detailRec, detailReq)
 	if detailRec.Code != http.StatusOK {
@@ -394,6 +426,7 @@ func TestResourceDetailIncludesImageMetadata(t *testing.T) {
 	resourceID := uploadTestPNG(t, api)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, req)
 	rec := httptest.NewRecorder()
 	api.Routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -428,6 +461,7 @@ func TestAuthenticatedTrafficIsAggregatedByUser(t *testing.T) {
 	}
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, detailReq)
 	detailRec := httptest.NewRecorder()
 	api.Routes().ServeHTTP(detailRec, detailReq)
 	if detailRec.Code != http.StatusOK {
@@ -457,6 +491,7 @@ func TestResourcesListAndStatsOverview(t *testing.T) {
 	_ = uploadTestPNG(t, api)
 
 	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources?page=1&pageSize=1&type=image&status=active", nil)
+	addAdminCookie(t, api, listReq)
 	listRec := httptest.NewRecorder()
 	api.Routes().ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {
