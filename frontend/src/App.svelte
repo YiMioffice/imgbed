@@ -15,6 +15,7 @@
   let isFeaturedAdminPage = false;
   let isExplorePage = false;
   let isAdminPage = false;
+  let isAdminProtectedPage = false;
   let isAccountPage = false;
 
   type AuthUser = { id: string; username: string; displayName: string; role: string; groupId: string; groupName: string; status: string };
@@ -49,6 +50,7 @@
   let installReady = false;
   let currentUser: AuthUser | null = null;
   let authReady = false;
+  let bootstrapReady = false;
   let homeStats: OverviewStats = { totalResources: 0, activeResources: 0, totalStorageBytes: 0, totalTrafficBytes: 0, todayUploads: 0, recentTraffic: [] };
   let homeStatsReady = false;
   let featuredResources: FeaturedResource[] = [];
@@ -121,6 +123,38 @@
   let featuredError = '';
   let featuredMessage = '';
   let routeLoadToken = 0;
+  const inflightLoads = new Map<string, Promise<void>>();
+  const cacheTTL = {
+    install: 60_000,
+    siteSettings: 30_000,
+    currentUser: 15_000,
+    homeStats: 15_000,
+    featuredResources: 30_000,
+    accountUsage: 15_000,
+    userGroups: 20_000,
+    users: 20_000,
+    policyGroups: 20_000,
+    policies: 20_000,
+    storageConfigs: 20_000,
+    resources: 10_000,
+    resourceDetail: 10_000
+  } as const;
+  const cacheTimestamps = {
+    install: 0,
+    siteSettings: 0,
+    currentUser: 0,
+    homeStats: 0,
+    featuredResources: 0,
+    accountUsage: 0,
+    userGroups: 0,
+    users: 0,
+    policyGroups: 0,
+    storageConfigs: 0,
+    resources: 0
+  };
+  let resourcesCacheKey = '';
+  const policyCacheTimestamps = new Map<string, number>();
+  const resourceDetailCacheTimestamps = new Map<string, number>();
 
   $: parts = path.split('/').filter(Boolean);
   $: resourceDetailId = parts[0] === 'admin' && parts[1] === 'resources' && parts[2] ? decodeURIComponent(parts[2]) : '';
@@ -134,7 +168,8 @@
   $: isSiteSettingsPage = path === '/admin/site';
   $: isFeaturedAdminPage = path === '/admin/featured';
   $: isExplorePage = path === '/explore';
-  $: isAdminPage = isDashboardPage || isPolicyPage || isResourcePage || isResourceDetailPage || isUserGroupPage || isUserPage || isStoragePage || isSiteSettingsPage || isFeaturedAdminPage;
+  $: isAdminPage = isDashboardPage || isPolicyPage || isResourcePage || isUserGroupPage || isUserPage || isStoragePage || isSiteSettingsPage || isFeaturedAdminPage;
+  $: isAdminProtectedPage = isAdminPage || isResourceDetailPage;
   $: isAccountPage = path === '/account';
 
   $: uploadGroup = currentUser?.groupId ?? 'guest';
@@ -148,6 +183,7 @@
     void (async () => {
       await Promise.all([loadInstallState(), loadSiteSettings(true)]);
       await loadCurrentUser();
+      bootstrapReady = true;
       await handleRouteChange();
     })();
     return () => window.removeEventListener('popstate', handlePopState);
@@ -162,6 +198,25 @@
   }
 
   function jump(url: string) { void navigate(url); }
+  function isFresh(timestamp: number, ttl: number) { return timestamp > 0 && Date.now() - timestamp < ttl; }
+  function runDeduped(key: string, task: () => Promise<void>) {
+    const pending = inflightLoads.get(key);
+    if (pending) return pending;
+    const next = task().finally(() => inflightLoads.delete(key));
+    inflightLoads.set(key, next);
+    return next;
+  }
+  function invalidateCache(...keys: Array<keyof typeof cacheTimestamps>) {
+    for (const key of keys) cacheTimestamps[key] = 0;
+  }
+  function currentResourcesKey() {
+    return JSON.stringify({
+      page: resourcePage,
+      pageSize: resourcePageSize,
+      filters: resourceFilters,
+      featured: isFeaturedAdminPage
+    });
+  }
 
   async function handleRouteChange() {
     const token = ++routeLoadToken;
@@ -178,7 +233,7 @@
       await navigate(currentUser.role === 'admin' ? '/admin' : '/account', true);
       return;
     }
-    if (isAdminPage && authReady && (!currentUser || currentUser.role !== 'admin')) {
+    if (isAdminProtectedPage && authReady && (!currentUser || currentUser.role !== 'admin')) {
       await navigate(currentUser ? '/account' : '/login', true);
       return;
     }
@@ -188,7 +243,7 @@
     if (path === '/' || isExplorePage || isFeaturedAdminPage) tasks.push(loadFeaturedResources(true));
     if (path === '/upload' || isAccountPage) tasks.push(loadAccountUsage());
 
-    if (currentUser?.role === 'admin' && isAdminPage) {
+    if (currentUser?.role === 'admin' && isAdminProtectedPage) {
       if (isDashboardPage) tasks.push(loadDashboardData());
       if (isPolicyPage) tasks.push(loadPolicyEditor());
       if (isUserGroupPage) tasks.push(loadUserGroups());
@@ -203,42 +258,104 @@
     await Promise.all(tasks);
     if (token !== routeLoadToken) return;
   }
-  async function loadInstallState() { try { const res = await fetch('/api/v1/install/state'); if (!res.ok) return; const payload = await res.json() as InstallState; installState = payload; siteName = payload.siteName || siteName; installForm.siteName = payload.siteName || installForm.siteName; installForm.defaultStorage = payload.defaultStorage || installForm.defaultStorage; if (payload.adminUsername) loginForm.username = payload.adminUsername; } finally { installReady = true; } }
+  async function loadInstallState(force = false) {
+    if (!force && installReady && isFresh(cacheTimestamps.install, cacheTTL.install)) return;
+    return runDeduped('install', async () => {
+      try {
+        const res = await fetch('/api/v1/install/state');
+        if (!res.ok) return;
+        const payload = await res.json() as InstallState;
+        installState = payload;
+        siteName = payload.siteName || siteName;
+        installForm.siteName = payload.siteName || installForm.siteName;
+        installForm.defaultStorage = payload.defaultStorage || installForm.defaultStorage;
+        if (payload.adminUsername) loginForm.username = payload.adminUsername;
+        cacheTimestamps.install = Date.now();
+      } finally {
+        installReady = true;
+      }
+    });
+  }
   async function loadSiteSettings(silent = false) {
+    if (isFresh(cacheTimestamps.siteSettings, cacheTTL.siteSettings)) return;
     if (!silent) {
       siteSettingsError = '';
       siteSettingsMessage = '';
     }
-    try {
-      const res = await fetch('/api/v1/site-settings');
-      const payload = await res.json();
-      if (!res.ok) return void (!silent && (siteSettingsError = payload.error ?? '加载站点设置失败'));
-      siteSettings = { ...defaultSiteSettings(), ...(payload.settings ?? {}) };
-      siteSettingsForm = { ...siteSettings };
-      siteName = siteSettings.siteName || siteName;
-    } catch (error) {
-      if (!silent) siteSettingsError = error instanceof Error ? error.message : '加载站点设置失败';
-    }
+    return runDeduped('siteSettings', async () => {
+      try {
+        const res = await fetch('/api/v1/site-settings');
+        const payload = await res.json();
+        if (!res.ok) return void (!silent && (siteSettingsError = payload.error ?? '加载站点设置失败'));
+        siteSettings = { ...defaultSiteSettings(), ...(payload.settings ?? {}) };
+        siteSettingsForm = { ...siteSettings };
+        siteName = siteSettings.siteName || siteName;
+        cacheTimestamps.siteSettings = Date.now();
+      } catch (error) {
+        if (!silent) siteSettingsError = error instanceof Error ? error.message : '加载站点设置失败';
+      }
+    });
   }
-  async function loadCurrentUser() { try { const res = await fetch('/api/v1/auth/me'); if (!res.ok) return; currentUser = (await res.json()).user ?? null; } finally { authReady = true; } }
-  async function loadHomeStats() { try { const res = await fetch('/api/v1/stats/overview'); if (!res.ok) return; homeStats = (await res.json()).stats ?? homeStats; } finally { homeStatsReady = true; } }
+  async function loadCurrentUser(force = false) {
+    if (!force && authReady && isFresh(cacheTimestamps.currentUser, cacheTTL.currentUser)) return;
+    return runDeduped('currentUser', async () => {
+      try {
+        const res = await fetch('/api/v1/auth/me');
+        currentUser = res.ok ? ((await res.json()).user ?? null) : null;
+        cacheTimestamps.currentUser = Date.now();
+      } finally {
+        authReady = true;
+      }
+    });
+  }
+  async function loadHomeStats(force = false) {
+    if (!force && homeStatsReady && isFresh(cacheTimestamps.homeStats, cacheTTL.homeStats)) return;
+    return runDeduped('homeStats', async () => {
+      try {
+        const res = await fetch('/api/v1/stats/overview');
+        if (!res.ok) return;
+        homeStats = (await res.json()).stats ?? homeStats;
+        cacheTimestamps.homeStats = Date.now();
+      } finally {
+        homeStatsReady = true;
+      }
+    });
+  }
   async function loadFeaturedResources(silent = false) {
+    if (featuredReady && isFresh(cacheTimestamps.featuredResources, cacheTTL.featuredResources)) return;
     if (!silent) {
       featuredError = '';
       featuredMessage = '';
     }
-    try {
-      const res = await fetch('/api/v1/featured-resources');
-      const payload = await res.json();
-      if (!res.ok) return void (!silent && (featuredError = payload.error ?? '加载精选资源失败'));
-      featuredResources = payload.items ?? [];
-    } catch (error) {
-      if (!silent) featuredError = error instanceof Error ? error.message : '加载精选资源失败';
-    } finally {
-      featuredReady = true;
-    }
+    return runDeduped('featuredResources', async () => {
+      try {
+        const res = await fetch('/api/v1/featured-resources');
+        const payload = await res.json();
+        if (!res.ok) return void (!silent && (featuredError = payload.error ?? '加载精选资源失败'));
+        featuredResources = payload.items ?? [];
+        cacheTimestamps.featuredResources = Date.now();
+      } catch (error) {
+        if (!silent) featuredError = error instanceof Error ? error.message : '加载精选资源失败';
+      } finally {
+        featuredReady = true;
+      }
+    });
   }
-  async function loadAccountUsage() { accountError = ''; try { const res = await fetch('/api/v1/account/usage'); const payload = await res.json(); if (!res.ok) return void (accountError = payload.error ?? '加载账户用量失败'); accountUsage = payload.usage ?? null; } catch (error) { accountError = error instanceof Error ? error.message : '加载账户用量失败'; } }
+  async function loadAccountUsage(force = false) {
+    if (!force && isFresh(cacheTimestamps.accountUsage, cacheTTL.accountUsage)) return;
+    accountError = '';
+    return runDeduped('accountUsage', async () => {
+      try {
+        const res = await fetch('/api/v1/account/usage');
+        const payload = await res.json();
+        if (!res.ok) return void (accountError = payload.error ?? '加载账户用量失败');
+        accountUsage = payload.usage ?? null;
+        cacheTimestamps.accountUsage = Date.now();
+      } catch (error) {
+        accountError = error instanceof Error ? error.message : '加载账户用量失败';
+      }
+    });
+  }
   async function loadDashboardData() { await Promise.all([loadUserGroups(true), loadUsers(true)]); }
   async function saveSiteSettings() {
     siteSettingsError = '';
@@ -261,7 +378,8 @@
       siteSettingsForm = { ...siteSettings };
       siteName = siteSettings.siteName || siteName;
       siteSettingsMessage = '站点设置已保存。';
-      await loadInstallState();
+      invalidateCache('siteSettings', 'install');
+      await loadInstallState(true);
     } catch (error) {
       siteSettingsError = error instanceof Error ? error.message : '保存站点设置失败';
     }
@@ -277,8 +395,9 @@
       const payload = await res.json();
       if (!res.ok) return void (installError = payload.error ?? '初始化失败');
       currentUser = payload.user;
-      await loadInstallState();
-      await loadHomeStats();
+      invalidateCache('install', 'currentUser', 'homeStats', 'siteSettings');
+      await loadInstallState(true);
+      await loadHomeStats(true);
       jump('/admin');
     } catch (error) {
       installError = error instanceof Error ? error.message : '初始化失败';
@@ -296,6 +415,8 @@
       const payload = await res.json();
       if (!res.ok) return void (loginError = payload.error ?? '登录失败');
       currentUser = payload.user;
+      cacheTimestamps.currentUser = Date.now();
+      invalidateCache('accountUsage');
       jump(payload.user?.role === 'admin' ? '/admin' : '/account');
     } catch (error) {
       loginError = error instanceof Error ? error.message : '登录失败';
@@ -307,6 +428,7 @@
   async function logout() {
     await fetch('/api/v1/auth/logout', { method: 'POST' });
     currentUser = null;
+    invalidateCache('currentUser', 'accountUsage');
     if (path.startsWith('/admin')) jump('/login');
   }
 
@@ -340,9 +462,10 @@
         return { ...item, progress: result.success ? 1 : 0, status: result.success ? 'success' : 'error', resource: result.resource, links: result.links, message: result.success ? (result.decision?.reason || '上传完成') : (result.error?.message || result.decision?.reason || '上传失败'), errorCode: result.error?.code };
       });
       uploadProgress = 1;
-      await loadHomeStats();
-      await loadAccountUsage();
-      if (isResourcePage) await loadResources();
+      invalidateCache('homeStats', 'accountUsage', 'resources', 'featuredResources');
+      await loadHomeStats(true);
+      await loadAccountUsage(true);
+      if (isResourcePage) await loadResources(resourcePage, true);
     } catch (error) {
       uploadError = error instanceof Error ? error.message : '上传失败';
       uploadQueue = uploadQueue.map((item) => ({ ...item, status: 'error', progress: 0, message: uploadError }));
@@ -385,8 +508,8 @@
     return ratio;
   }
 
-  async function loadPolicyGroups() { policyGroupError = ''; try { const res = await fetch('/api/v1/policy-groups'); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '加载策略组失败'); policyGroups = payload.groups ?? []; activePolicyGroupId = payload.activeGroup?.id ?? ''; if (!selectedPolicyGroupId || !policyGroups.some((group) => group.id === selectedPolicyGroupId)) selectedPolicyGroupId = activePolicyGroupId || policyGroups[0]?.id || ''; } catch (error) { policyGroupError = error instanceof Error ? error.message : '加载策略组失败'; } }
-  async function loadPolicies(groupId = selectedPolicyGroupId) { const resolved = groupId || activePolicyGroupId; if (!resolved) return; policySaveError = ''; policySaveMessage = ''; try { const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(resolved)}`); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.error ?? '加载策略失败'); selectedPolicyGroupId = payload.group?.id ?? resolved; rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); } catch (error) { policySaveError = error instanceof Error ? error.message : '加载策略失败'; } }
+  async function loadPolicyGroups(force = false) { if (!force && isFresh(cacheTimestamps.policyGroups, cacheTTL.policyGroups)) return; policyGroupError = ''; return runDeduped('policyGroups', async () => { try { const res = await fetch('/api/v1/policy-groups'); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '加载策略组失败'); policyGroups = payload.groups ?? []; activePolicyGroupId = payload.activeGroup?.id ?? ''; if (!selectedPolicyGroupId || !policyGroups.some((group) => group.id === selectedPolicyGroupId)) selectedPolicyGroupId = activePolicyGroupId || policyGroups[0]?.id || ''; cacheTimestamps.policyGroups = Date.now(); } catch (error) { policyGroupError = error instanceof Error ? error.message : '加载策略组失败'; } }); }
+  async function loadPolicies(groupId = selectedPolicyGroupId, force = false) { const resolved = groupId || activePolicyGroupId; if (!resolved) return; if (!force && policyCacheTimestamps.has(resolved) && isFresh(policyCacheTimestamps.get(resolved) ?? 0, cacheTTL.policies)) return; policySaveError = ''; policySaveMessage = ''; return runDeduped(`policies:${resolved}`, async () => { try { const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(resolved)}`); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.error ?? '加载策略失败'); selectedPolicyGroupId = payload.group?.id ?? resolved; rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.set(resolved, Date.now()); } catch (error) { policySaveError = error instanceof Error ? error.message : '加载策略失败'; } }); }
   async function loadPolicyEditor(groupId = selectedPolicyGroupId) {
     await loadPolicyGroups();
     const resolved = groupId || selectedPolicyGroupId || activePolicyGroupId || policyGroups[0]?.id || '';
@@ -402,30 +525,34 @@
   async function createPolicyGroup() { policyGroupError = ''; if (!policyGroupForm.name.trim()) return void (policyGroupError = '请输入策略组名称。'); isCreatingPolicyGroup = true; try { const res = await fetch('/api/v1/policy-groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(policyGroupForm) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '创建策略组失败'); policyGroupForm = { name: '', description: '' }; selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '创建策略组失败'; } finally { isCreatingPolicyGroup = false; } }
   async function copyPolicyGroup(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `${group.name} 副本` }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '复制策略组失败'); selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '复制策略组失败'; } }
   async function setPolicyGroupActive(group: PolicyGroup, active: boolean) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '更新策略组状态失败'); await loadPolicyEditor(selectedPolicyGroupId || payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '更新策略组状态失败'; } }
-  async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policySaveMessage = '策略已保存。'; await loadPolicyGroups(); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
+  async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.delete(selectedPolicyGroupId); cacheTimestamps.policyGroups = 0; policySaveMessage = '策略已保存。'; await loadPolicyGroups(true); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
   async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: Number(policyForm.size) || 0 }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
-  async function loadUserGroups(silent = false) { if (!silent) { userGroupError = ''; userGroupMessage = ''; } try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }
-  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; await loadUserGroups(true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } }
-  async function loadUsers(silent = false) { if (!silent) { userAdminError = ''; userAdminMessage = ''; } try { const res = await fetch('/api/v1/users'); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '加载用户失败'); managedUsers = payload.users ?? []; } catch (error) { if (!silent) userAdminError = error instanceof Error ? error.message : '加载用户失败'; } }
+  async function loadUserGroups(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.userGroups, cacheTTL.userGroups)) return; if (!silent) { userGroupError = ''; userGroupMessage = ''; } return runDeduped('userGroups', async () => { try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; cacheTimestamps.userGroups = Date.now(); } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }); }
+  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } }
+  async function loadUsers(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.users, cacheTTL.users)) return; if (!silent) { userAdminError = ''; userAdminMessage = ''; } return runDeduped('users', async () => { try { const res = await fetch('/api/v1/users'); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '加载用户失败'); managedUsers = payload.users ?? []; cacheTimestamps.users = Date.now(); } catch (error) { if (!silent) userAdminError = error instanceof Error ? error.message : '加载用户失败'; } }); }
   async function loadUserAdminData() { await loadUserGroups(true); await loadUsers(); }
-  async function loadStorageConfigs() {
+  async function loadStorageConfigs(force = false) {
+    if (!force && isFresh(cacheTimestamps.storageConfigs, cacheTTL.storageConfigs)) return;
     storageError = '';
     storageMessage = '';
     storageHealthResult = '';
-    try {
-      const res = await fetch('/api/v1/storage-configs');
-      const payload = await res.json();
-      if (!res.ok) return void (storageError = payload.error ?? '加载存储配置失败');
-      const configs = payload.configs ?? [];
-      const defaultId = payload.defaultConfig?.id ?? 'local';
-      storageConfigs = [
-        ensureStorageConfig(findStorageConfig(configs, 'local', 'local') ?? { id: 'local', type: 'local', name: '本机存储', usePathStyle: true }, 'local'),
-        ensureStorageConfig(findStorageConfig(configs, 's3-default', 's3') ?? { id: 's3-default', type: 's3', name: 'S3 兼容存储', usePathStyle: true }, 's3'),
-        ensureStorageConfig(findStorageConfig(configs, 'webdav-default', 'webdav') ?? { id: 'webdav-default', type: 'webdav', name: 'WebDAV 存储', usePathStyle: true }, 'webdav')
-      ].map((config) => ({ ...config, isDefault: config.id === defaultId }));
-    } catch (error) {
-      storageError = error instanceof Error ? error.message : '加载存储配置失败';
-    }
+    return runDeduped('storageConfigs', async () => {
+      try {
+        const res = await fetch('/api/v1/storage-configs');
+        const payload = await res.json();
+        if (!res.ok) return void (storageError = payload.error ?? '加载存储配置失败');
+        const configs = payload.configs ?? [];
+        const defaultId = payload.defaultConfig?.id ?? 'local';
+        storageConfigs = [
+          ensureStorageConfig(findStorageConfig(configs, 'local', 'local') ?? { id: 'local', type: 'local', name: '本机存储', usePathStyle: true }, 'local'),
+          ensureStorageConfig(findStorageConfig(configs, 's3-default', 's3') ?? { id: 's3-default', type: 's3', name: 'S3 兼容存储', usePathStyle: true }, 's3'),
+          ensureStorageConfig(findStorageConfig(configs, 'webdav-default', 'webdav') ?? { id: 'webdav-default', type: 'webdav', name: 'WebDAV 存储', usePathStyle: true }, 'webdav')
+        ].map((config) => ({ ...config, isDefault: config.id === defaultId }));
+        cacheTimestamps.storageConfigs = Date.now();
+      } catch (error) {
+        storageError = error instanceof Error ? error.message : '加载存储配置失败';
+      }
+    });
   }
   async function saveStorageConfig(config: StorageConfig) {
     storageError = '';
@@ -453,7 +580,8 @@
       const payload = await res.json();
       if (!res.ok) return void (storageError = payload.error ?? '保存存储配置失败');
       storageMessage = `${payload.config?.name ?? config.name} 已保存。`;
-      await loadStorageConfigs();
+      invalidateCache('storageConfigs');
+      await loadStorageConfigs(true);
     } catch (error) {
       storageError = error instanceof Error ? error.message : '保存存储配置失败';
     }
@@ -489,36 +617,43 @@
       storageError = error instanceof Error ? error.message : '存储健康检查失败';
     }
   }
-  async function createManagedUser() { userAdminError = ''; userAdminMessage = ''; if (!createUserForm.username.trim() || !createUserForm.displayName.trim() || createUserForm.password.length < 8) return void (userAdminError = '请填写账号、昵称和至少 8 位密码。'); try { const res = await fetch('/api/v1/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(createUserForm) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '创建用户失败'); createUserForm = { username: '', displayName: '', password: '', groupId: 'user', status: 'active' }; userAdminMessage = '用户已创建。'; await loadUsers(true); } catch (error) { userAdminError = error instanceof Error ? error.message : '创建用户失败'; } }
-  async function saveManagedUser(user: ManagedUser) { userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ displayName: user.displayName, groupId: user.groupId, status: user.status }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '保存用户失败'); userAdminMessage = `${user.displayName} 已保存。`; await loadUsers(true); } catch (error) { userAdminError = error instanceof Error ? error.message : '保存用户失败'; } }
+  async function createManagedUser() { userAdminError = ''; userAdminMessage = ''; if (!createUserForm.username.trim() || !createUserForm.displayName.trim() || createUserForm.password.length < 8) return void (userAdminError = '请填写账号、昵称和至少 8 位密码。'); try { const res = await fetch('/api/v1/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(createUserForm) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '创建用户失败'); createUserForm = { username: '', displayName: '', password: '', groupId: 'user', status: 'active' }; userAdminMessage = '用户已创建。'; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '创建用户失败'; } }
+  async function saveManagedUser(user: ManagedUser) { userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ displayName: user.displayName, groupId: user.groupId, status: user.status }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '保存用户失败'); userAdminMessage = `${user.displayName} 已保存。`; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '保存用户失败'; } }
   async function toggleUserBan(user: ManagedUser) { const nextStatus = user.status === 'banned' ? 'active' : 'banned'; if (!window.confirm(`${nextStatus === 'banned' ? '确认封禁' : '确认解封'} ${user.displayName} 吗？`)) return; await saveManagedUser({ ...user, status: nextStatus }); }
   async function resetManagedUserPassword(user: ManagedUser) { const password = window.prompt(`为 ${user.displayName} 输入新密码`, ''); if (!password) return; if (password.length < 8) return void (userAdminError = '新密码至少需要 8 位。'); if (!window.confirm(`确认重置 ${user.displayName} 的密码吗？`)) return; userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '重置密码失败'); userAdminMessage = `${user.displayName} 的密码已重置。`; } catch (error) { userAdminError = error instanceof Error ? error.message : '重置密码失败'; } }
 
-  async function loadResources(page = resourcePage) {
+  async function loadResources(page = resourcePage, force = false) {
+    resourcePage = page;
+    const nextKey = currentResourcesKey();
+    if (!force && resources.length > 0 && resourcesCacheKey === nextKey && isFresh(cacheTimestamps.resources, cacheTTL.resources)) return;
     isLoadingResources = true;
     resourceError = '';
-    try {
-      const params = new URLSearchParams({ page: String(page), pageSize: String(resourcePageSize), sort: resourceFilters.sort });
-      if (resourceFilters.search.trim()) params.set('search', resourceFilters.search.trim());
-      if (resourceFilters.type) params.set('type', resourceFilters.type);
-      if (resourceFilters.status) params.set('status', resourceFilters.status);
-      if (resourceFilters.userGroup) params.set('userGroup', resourceFilters.userGroup);
-      const res = await fetch(`/api/v1/resources?${params.toString()}`);
-      const payload = await res.json();
-      if (!res.ok) return void (resourceError = payload.error ?? '加载资源失败');
-      resources = payload.items ?? [];
-      resourcePage = payload.page ?? 1;
-      resourceTotal = payload.total ?? 0;
-      resourceTotalPages = payload.totalPages ?? 0;
-    } catch (error) {
-      resourceError = error instanceof Error ? error.message : '加载资源失败';
-    } finally {
-      isLoadingResources = false;
-    }
+    return runDeduped(`resources:${nextKey}`, async () => {
+      try {
+        const params = new URLSearchParams({ page: String(page), pageSize: String(resourcePageSize), sort: resourceFilters.sort });
+        if (resourceFilters.search.trim()) params.set('search', resourceFilters.search.trim());
+        if (resourceFilters.type) params.set('type', resourceFilters.type);
+        if (resourceFilters.status) params.set('status', resourceFilters.status);
+        if (resourceFilters.userGroup) params.set('userGroup', resourceFilters.userGroup);
+        const res = await fetch(`/api/v1/resources?${params.toString()}`);
+        const payload = await res.json();
+        if (!res.ok) return void (resourceError = payload.error ?? '加载资源失败');
+        resources = payload.items ?? [];
+        resourcePage = payload.page ?? 1;
+        resourceTotal = payload.total ?? 0;
+        resourceTotalPages = payload.totalPages ?? 0;
+        resourcesCacheKey = nextKey;
+        cacheTimestamps.resources = Date.now();
+      } catch (error) {
+        resourceError = error instanceof Error ? error.message : '加载资源失败';
+      } finally {
+        isLoadingResources = false;
+      }
+    });
   }
 
-  async function loadResourceDetail(id: string) { isLoadingDetail = true; detailError = ''; signedLinkResult = null; try { const res = await fetch(`/api/v1/resources/${encodeURIComponent(id)}`); const payload = await res.json(); if (!res.ok) return void (detailError = payload.error ?? '加载资源详情失败'); resourceDetail = payload.detail; } catch (error) { detailError = error instanceof Error ? error.message : '加载资源详情失败'; } finally { isLoadingDetail = false; } }
-  async function mutateResource(url: string, method: string) { resourceError = ''; const res = await fetch(url, { method }); const payload = await res.json(); if (!res.ok) return void (resourceError = payload.error ?? '资源操作失败'); await loadResources(resourcePage); if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id); await loadHomeStats(); }
+  async function loadResourceDetail(id: string, force = false) { if (!id) return; if (!force && resourceDetail?.record.id === id && isFresh(resourceDetailCacheTimestamps.get(id) ?? 0, cacheTTL.resourceDetail)) return; isLoadingDetail = true; detailError = ''; signedLinkResult = null; return runDeduped(`resourceDetail:${id}`, async () => { try { const res = await fetch(`/api/v1/resources/${encodeURIComponent(id)}`); const payload = await res.json(); if (!res.ok) return void (detailError = payload.error ?? '加载资源详情失败'); resourceDetail = payload.detail; resourceDetailCacheTimestamps.set(id, Date.now()); } catch (error) { detailError = error instanceof Error ? error.message : '加载资源详情失败'; } finally { isLoadingDetail = false; } }); }
+  async function mutateResource(url: string, method: string) { resourceError = ''; const res = await fetch(url, { method }); const payload = await res.json(); if (!res.ok) return void (resourceError = payload.error ?? '资源操作失败'); invalidateCache('resources', 'homeStats', 'featuredResources'); if (payload.resource?.id) resourceDetailCacheTimestamps.delete(payload.resource.id); await loadResources(resourcePage, true); if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id, true); await loadHomeStats(true); }
   const deleteResource = (id: string) => mutateResource(`/api/v1/resources/${id}`, 'DELETE');
   const restoreResource = (id: string) => mutateResource(`/api/v1/resources/${id}/restore`, 'POST');
   async function updateResourceVisibility(id: string, isPrivate: boolean) {
@@ -531,8 +666,10 @@
     });
     const payload = await res.json();
     if (!res.ok) return void (detailError = payload.error ?? '更新资源可见性失败');
-    if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id);
-    if (isResourcePage || isFeaturedAdminPage) await loadResources(resourcePage);
+    invalidateCache('resources', 'featuredResources');
+    if (payload.resource?.id) resourceDetailCacheTimestamps.delete(payload.resource.id);
+    if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id, true);
+    if (isResourcePage || isFeaturedAdminPage) await loadResources(resourcePage, true);
     await loadFeaturedResources(true);
   }
   async function generateSignedLink(id: string) {
@@ -561,6 +698,7 @@
       const payload = await res.json();
       if (!res.ok) return void (featuredError = payload.error ?? '添加精选失败');
       featuredMessage = `${record.originalName} 已加入精选。`;
+      invalidateCache('featuredResources');
       await loadFeaturedResources(true);
     } catch (error) {
       featuredError = error instanceof Error ? error.message : '添加精选失败';
@@ -574,6 +712,7 @@
       const payload = await res.json();
       if (!res.ok) return void (featuredError = payload.error ?? '下架精选失败');
       featuredMessage = '精选资源已下架。';
+      invalidateCache('featuredResources');
       await loadFeaturedResources(true);
     } catch (error) {
       featuredError = error instanceof Error ? error.message : '下架精选失败';
@@ -602,7 +741,33 @@
     }
   }
 
-  async function copyText(value: string) { try { await navigator.clipboard.writeText(value); copyMessage = '已复制。'; setTimeout(() => { copyMessage = ''; }, 1600); } catch { copyMessage = '复制失败，请手动复制。'; } }
+  async function copyText(value: string) {
+    const done = (message: string) => {
+      copyMessage = message;
+      setTimeout(() => { copyMessage = ''; }, 1800);
+    };
+    try {
+      if (navigator.clipboard?.writeText && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return done('已复制。');
+      }
+      const input = document.createElement('textarea');
+      input.value = value;
+      input.setAttribute('readonly', 'true');
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      input.style.pointerEvents = 'none';
+      document.body.appendChild(input);
+      input.select();
+      input.setSelectionRange(0, input.value.length);
+      const copied = document.execCommand('copy');
+      document.body.removeChild(input);
+      if (copied) return done(window.isSecureContext ? '已复制。' : '已兼容复制。');
+    } catch {
+      // fall through to manual copy hint
+    }
+    done(window.isSecureContext ? '复制失败，请手动复制。' : '当前为 HTTP 环境，系统剪贴板受限，请手动复制。');
+  }
   function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = value; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`; }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
@@ -634,9 +799,17 @@
   }
 </script>
 
-{#if path === '/install'}
+{#if !bootstrapReady}
   <main class="page-shell narrow">
-    <a class="back-link" href="/">返回首页</a>
+    <section class="glass-panel page-panel">
+      <p class="eyebrow">Machring Static Hosting</p>
+      <h1>正在加载</h1>
+      <p class="lead compact">正在读取站点状态和登录信息。</p>
+    </section>
+  </main>
+{:else if path === '/install'}
+  <main class="page-shell narrow">
+    <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
       <p class="eyebrow">Machring Static Hosting</p>
       <h1>初始化</h1>
@@ -654,7 +827,7 @@
   </main>
 {:else if path === '/upload'}
   <main class="page-shell wide" on:paste={handlePaste}>
-    <a class="back-link" href="/">返回首页</a>
+    <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel upload-panel">
       <div class="panel-head">
         <div>
@@ -698,6 +871,9 @@
                   <div class="progress-track"><span style={`width: ${Math.round(item.progress * 100)}%`}></span></div>
                   <p class:success-copy={item.status === 'success'} class:error-copy={item.status === 'error'} class="upload-message">{item.message || (item.status === 'uploading' ? '上传中' : '等待上传')}</p>
                   {#if item.links}
+                    <div class="upload-links-preview">
+                      <label>直链<input readonly value={item.links.direct} /></label>
+                    </div>
                     <div class="link-grid compact">
                       <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.direct || '')}>复制直链</button>
                       <button class="button ghost compact" type="button" on:click={() => copyText(item.links?.markdown || '')}>复制 Markdown</button>
@@ -719,7 +895,7 @@
   </main>
 {:else if isAccountPage}
   <main class="page-shell wide">
-    <a class="back-link" href="/">返回首页</a>
+    <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
       <div class="panel-head">
         <div>
@@ -769,6 +945,120 @@
       </form>
     </section>
   </main>
+{:else if isResourceDetailPage}
+  {#if !authReady}
+  <main class="page-shell narrow">
+    <section class="glass-panel page-panel">
+      <p class="eyebrow">Machring Resource Detail</p>
+      <h1>正在检查登录状态</h1>
+      <p class="lead compact">正在确认管理员会话。</p>
+    </section>
+  </main>
+  {:else if !currentUser || currentUser.role !== 'admin'}
+  <main class="page-shell narrow">
+    <section class="glass-panel page-panel">
+      <p class="eyebrow">Machring Resource Detail</p>
+      <h1>需要管理员登录</h1>
+      <p class="lead compact">正在跳转到登录页。</p>
+    </section>
+  </main>
+  {:else}
+  <main class="page-shell wide">
+    <a class="back-link" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>返回资源管理</a>
+    <section class="glass-panel page-panel resource-detail-page">
+      <div class="panel-head">
+        <div>
+          <p class="eyebrow">Machring Resource Detail</p>
+          <h1>资源详情</h1>
+          <p class="lead compact">独立查看资源元数据、流量、外链和访问窗口。</p>
+        </div>
+        <div class="summary-card"><span>当前账号</span><strong>{currentUser.displayName}</strong></div>
+      </div>
+      <div class="resource-detail-toolbar">
+        <a class="button ghost compact" href="/admin" on:click|preventDefault={() => navigate('/admin')}>返回后台首页</a>
+        <a class="button secondary compact" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>返回资源列表</a>
+        {#if resourceDetail && copyMessage}<span class="form-success">{copyMessage}</span>{/if}
+      </div>
+      {#if detailError}
+        <p class="form-error">{detailError}</p>
+      {:else if isLoadingDetail || !resourceDetail}
+        <p>加载详情中…</p>
+      {:else}
+        <div class="resource-detail-grid">
+          <section class="detail-panel">
+            <div class="subsection-heading">
+              <h3>{resourceDetail.record.originalName}</h3>
+              <p>{securityHint(resourceDetail.record)}</p>
+            </div>
+            {#if resourceDetail.record.type === 'image' && resourceDetail.record.status !== 'deleted'}
+              <div class="preview-panel">
+                <img src={resourceDetail.record.publicUrl} alt={resourceDetail.record.originalName} />
+              </div>
+            {:else}
+              <div class="preview-panel muted">
+                <strong>{resourceDetail.record.type}</strong>
+                <span>{formatBytes(resourceDetail.record.size)}</span>
+              </div>
+            {/if}
+            <div class="resource-actions">
+              <button class="button secondary compact" type="button" on:click={() => updateResourceVisibility(resourceDetail.record.id, !resourceDetail.record.isPrivate)}>
+                {resourceDetail.record.isPrivate ? '设为公开' : '设为私有'}
+              </button>
+            </div>
+            <div class="link-grid">
+              <label>直链<input readonly value={resourceDetail.links.direct} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.direct)}>复制直链</button>
+              <label>Markdown<input readonly value={resourceDetail.links.markdown} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.markdown)}>复制 Markdown</button>
+              <label>HTML<input readonly value={resourceDetail.links.html} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.html)}>复制 HTML</button>
+              <label>BBCode<input readonly value={resourceDetail.links.bbcode} /></label>
+              <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.bbcode)}>复制 BBCode</button>
+              <label>签名链接有效期（秒）<input bind:value={signedLinkExpiresInSeconds} min="60" max="604800" type="number" /></label>
+              <button class="button ghost compact" type="button" on:click={() => generateSignedLink(resourceDetail.record.id)}>生成签名链接</button>
+              <label>签名链接<input readonly value={signedLinkResult?.url ?? ''} /></label>
+              <button class="button ghost compact" disabled={!signedLinkResult?.url} type="button" on:click={() => copyText(signedLinkResult?.url ?? '')}>复制签名链接</button>
+              <label>签名过期时间<input readonly value={signedLinkResult?.expiresAt ? formatDateTime(signedLinkResult.expiresAt) : ''} /></label>
+            </div>
+          </section>
+          <section class="detail-panel">
+            <div class="stats-grid">
+              <article><span>访问次数</span><strong>{resourceDetail.record.accessCount}</strong></article>
+              <article><span>累计流量</span><strong>{formatBytes(resourceDetail.record.trafficBytes)}</strong></article>
+              <article><span>月流量</span><strong>{formatBytes(resourceDetail.record.monthlyTraffic)} / {formatBytes(resourceDetail.record.monthlyLimit)}</strong></article>
+              <article><span>图片尺寸</span><strong>{resourceDetail.metadata.imageWidth > 0 ? `${resourceDetail.metadata.imageWidth} × ${resourceDetail.metadata.imageHeight}` : '无'}</strong></article>
+            </div>
+            <dl class="detail-list">
+              <div><dt>资源 ID</dt><dd>{resourceDetail.record.id}</dd></div>
+              <div><dt>可见性</dt><dd>{resourceDetail.record.isPrivate ? '私有' : '公开'}</dd></div>
+              <div><dt>存储驱动</dt><dd>{resourceDetail.record.storageDriver}</dd></div>
+              <div><dt>对象键</dt><dd>{resourceDetail.record.objectKey}</dd></div>
+              <div><dt>MIME</dt><dd>{resourceDetail.record.contentType || '未知'}</dd></div>
+              <div><dt>缓存策略</dt><dd>{resourceDetail.record.cacheControl || '未设置'}</dd></div>
+              <div><dt>下载策略</dt><dd>{resourceDetail.record.disposition || 'inline'}</dd></div>
+              <div><dt>上传 IP</dt><dd>{resourceDetail.record.uploadIp || '无'}</dd></div>
+              <div><dt>User-Agent</dt><dd>{resourceDetail.record.uploadUserAgent || '无'}</dd></div>
+              <div><dt>头摘要</dt><dd>{resourceDetail.metadata.headerSha256 || '无'}</dd></div>
+              <div><dt>创建时间</dt><dd>{formatDateTime(resourceDetail.record.createdAt)}</dd></div>
+            </dl>
+            <div class="subsection-heading compact-head"><h3>流量窗口</h3></div>
+            <div class="window-list">
+              {#each resourceDetail.trafficWindows as window}
+                <article class="window-card">
+                  <strong>{window.windowType === 'month' ? '月窗口' : '日窗口'} {window.windowKey}</strong>
+                  <span>{window.requestCount} 次访问 · {formatBytes(window.trafficBytes)}</span>
+                </article>
+              {/each}
+              {#if resourceDetail.trafficWindows.length === 0}
+                <p>还没有访问记录。</p>
+              {/if}
+            </div>
+          </section>
+        </div>
+      {/if}
+    </section>
+  </main>
+  {/if}
 {:else if isAdminPage}
   {#if !authReady}
   <main class="page-shell narrow">
@@ -1017,6 +1307,8 @@
                   <div class="resource-stats-grid">
                     <article><span>创建时间</span><strong>{formatDateTime(item.createdAt)}</strong></article>
                     <article><span>存储驱动</span><strong>{item.storageDriver}</strong></article>
+                    <article><span>访问次数</span><strong>{item.accessCount}</strong></article>
+                    <article><span>累计流量</span><strong>{formatBytes(item.trafficBytes)}</strong></article>
                   </div>
                   <div class="resource-actions">
                     {#if isFeaturedResource(item.id)}
@@ -1042,93 +1334,13 @@
         <div class="resource-toolbar"><span>共 {resourceTotal} 条资源</span><button class="button secondary compact" type="button" on:click={() => loadResources(resourcePage)} disabled={isLoadingResources}>{isLoadingResources ? '刷新中' : '刷新'}</button></div>
         <div class="resource-list" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
         {#if resourceTotalPages > 1}<nav class="pagination" aria-label="资源分页"><button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage - 1)} disabled={resourcePage <= 1}>上一页</button>{#each pageRange() as pageNumber}<button class:active-page={pageNumber === resourcePage} class="button ghost compact" type="button" on:click={() => changeResourcePage(pageNumber)}>{pageNumber}</button>{/each}<button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage + 1)} disabled={resourcePage >= resourceTotalPages}>下一页</button></nav>{/if}
-      {:else}
-        <div class="section-heading"><p class="eyebrow">Resource Detail</p><h2>资源详情</h2><p>查看资源元数据、预览、全部外链格式、流量窗口和审计信息。</p></div>
-        <div class="resource-detail-toolbar"><a class="button ghost compact" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>返回资源列表</a>{#if resourceDetail && copyMessage}<span class="form-success">{copyMessage}</span>{/if}</div>
-        {#if detailError}
-          <p class="form-error">{detailError}</p>
-        {:else if isLoadingDetail || !resourceDetail}
-          <p>加载详情中…</p>
-        {:else}
-          <div class="resource-detail-grid">
-            <section class="detail-panel">
-              <div class="subsection-heading">
-                <h3>{resourceDetail.record.originalName}</h3>
-                <p>{securityHint(resourceDetail.record)}</p>
-              </div>
-              {#if resourceDetail.record.type === 'image' && resourceDetail.record.status !== 'deleted'}
-                <div class="preview-panel">
-                  <img src={resourceDetail.record.publicUrl} alt={resourceDetail.record.originalName} />
-                </div>
-              {:else}
-                <div class="preview-panel muted">
-                  <strong>{resourceDetail.record.type}</strong>
-                  <span>{formatBytes(resourceDetail.record.size)}</span>
-                </div>
-              {/if}
-              <div class="resource-actions">
-                <button class="button secondary compact" type="button" on:click={() => updateResourceVisibility(resourceDetail.record.id, !resourceDetail.record.isPrivate)}>
-                  {resourceDetail.record.isPrivate ? '设为公开' : '设为私有'}
-                </button>
-              </div>
-              <div class="link-grid">
-                <label>直链<input readonly value={resourceDetail.links.direct} /></label>
-                <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.direct)}>复制直链</button>
-                <label>Markdown<input readonly value={resourceDetail.links.markdown} /></label>
-                <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.markdown)}>复制 Markdown</button>
-                <label>HTML<input readonly value={resourceDetail.links.html} /></label>
-                <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.html)}>复制 HTML</button>
-                <label>BBCode<input readonly value={resourceDetail.links.bbcode} /></label>
-                <button class="button ghost compact" type="button" on:click={() => copyText(resourceDetail.links.bbcode)}>复制 BBCode</button>
-                <label>签名链接有效期（秒）<input bind:value={signedLinkExpiresInSeconds} min="60" max="604800" type="number" /></label>
-                <button class="button ghost compact" type="button" on:click={() => generateSignedLink(resourceDetail.record.id)}>生成签名链接</button>
-                <label>签名链接<input readonly value={signedLinkResult?.url ?? ''} /></label>
-                <button class="button ghost compact" disabled={!signedLinkResult?.url} type="button" on:click={() => copyText(signedLinkResult?.url ?? '')}>复制签名链接</button>
-                <label>签名过期时间<input readonly value={signedLinkResult?.expiresAt ? formatDateTime(signedLinkResult.expiresAt) : ''} /></label>
-              </div>
-            </section>
-            <section class="detail-panel">
-              <div class="stats-grid">
-                <article><span>访问次数</span><strong>{resourceDetail.record.accessCount}</strong></article>
-                <article><span>累计流量</span><strong>{formatBytes(resourceDetail.record.trafficBytes)}</strong></article>
-                <article><span>月流量</span><strong>{formatBytes(resourceDetail.record.monthlyTraffic)} / {formatBytes(resourceDetail.record.monthlyLimit)}</strong></article>
-                <article><span>图片尺寸</span><strong>{resourceDetail.metadata.imageWidth > 0 ? `${resourceDetail.metadata.imageWidth} × ${resourceDetail.metadata.imageHeight}` : '无'}</strong></article>
-              </div>
-              <dl class="detail-list">
-                <div><dt>资源 ID</dt><dd>{resourceDetail.record.id}</dd></div>
-                <div><dt>可见性</dt><dd>{resourceDetail.record.isPrivate ? '私有' : '公开'}</dd></div>
-                <div><dt>存储驱动</dt><dd>{resourceDetail.record.storageDriver}</dd></div>
-                <div><dt>对象键</dt><dd>{resourceDetail.record.objectKey}</dd></div>
-                <div><dt>MIME</dt><dd>{resourceDetail.record.contentType || '未知'}</dd></div>
-                <div><dt>缓存策略</dt><dd>{resourceDetail.record.cacheControl || '未设置'}</dd></div>
-                <div><dt>下载策略</dt><dd>{resourceDetail.record.disposition || 'inline'}</dd></div>
-                <div><dt>上传 IP</dt><dd>{resourceDetail.record.uploadIp || '无'}</dd></div>
-                <div><dt>User-Agent</dt><dd>{resourceDetail.record.uploadUserAgent || '无'}</dd></div>
-                <div><dt>头摘要</dt><dd>{resourceDetail.metadata.headerSha256 || '无'}</dd></div>
-                <div><dt>创建时间</dt><dd>{formatDateTime(resourceDetail.record.createdAt)}</dd></div>
-              </dl>
-              <div class="subsection-heading compact-head"><h3>流量窗口</h3></div>
-              <div class="window-list">
-                {#each resourceDetail.trafficWindows as window}
-                  <article class="window-card">
-                    <strong>{window.windowType === 'month' ? '月窗口' : '日窗口'} {window.windowKey}</strong>
-                    <span>{window.requestCount} 次访问 · {formatBytes(window.trafficBytes)}</span>
-                  </article>
-                {/each}
-                {#if resourceDetail.trafficWindows.length === 0}
-                  <p>还没有访问记录。</p>
-                {/if}
-              </div>
-            </section>
-          </div>
-        {/if}
       {/if}
     </section>
   </main>
   {/if}
 {:else if isExplorePage}
   <main class="page-shell wide">
-    <a class="back-link" href="/">返回首页</a>
+    <a class="back-link" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a>
     <section class="glass-panel page-panel">
       <div class="panel-head">
         <div>
