@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ func NewSQLite(path string, defaultRules []policy.Rule) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	configureSQLite(db)
 
 	store := &SQLiteStore{db: db}
 	if err := store.migrate(context.Background()); err != nil {
@@ -67,6 +69,19 @@ func NewSQLite(path string, defaultRules []policy.Rule) (*SQLiteStore, error) {
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+func configureSQLite(db *sql.DB) {
+	connections := runtime.GOMAXPROCS(0)
+	if connections < 4 {
+		connections = 4
+	}
+	if connections > 16 {
+		connections = 16
+	}
+	db.SetMaxOpenConns(connections)
+	db.SetMaxIdleConns(connections)
+	db.SetConnMaxLifetime(30 * time.Minute)
 }
 
 func (s *SQLiteStore) Rules(ctx context.Context) ([]policy.Rule, error) {
@@ -1553,6 +1568,17 @@ func (s *SQLiteStore) ResourceStats(ctx context.Context) (resource.Stats, error)
 }
 
 func (s *SQLiteStore) migrate(ctx context.Context) error {
+	pragmas := []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA foreign_keys = ON`,
+		`PRAGMA synchronous = NORMAL`,
+		`PRAGMA temp_store = MEMORY`,
+	}
+	for _, pragma := range pragmas {
+		if _, err := s.db.ExecContext(ctx, pragma); err != nil {
+			return err
+		}
+	}
 	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
 		return err
 	}

@@ -7,15 +7,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"os"
 	"path"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"machring/internal/app"
@@ -87,8 +89,7 @@ func (api *API) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/resources/upload", api.uploadResource)
 	mux.HandleFunc("GET /api/v1/stats/overview", api.statsOverview)
 	mux.HandleFunc("GET /r/{id}", api.serveResource)
-	mux.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(api.app.Config.UploadDir))))
-	return mux
+	return secureMiddleware(mux)
 }
 
 func (api *API) health(w http.ResponseWriter, r *http.Request) {
@@ -208,14 +209,7 @@ func (api *API) installSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    session.Token,
-		Path:     "/",
-		Expires:  session.ExpiresAt,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	setSessionCookie(w, r, session.Token, session.ExpiresAt)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"initialized": true,
 		"user":        user,
@@ -762,15 +756,39 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := make([]uploadItemResponse, 0, len(files))
+	items := make([]uploadItemResponse, len(files))
 	successes := 0
 	publicBaseURL := api.publicResourceBaseURL(settings)
-	for _, header := range files {
-		item := api.handleUploadFile(r.Context(), actorPtr, group, header, clientAddr, r.UserAgent(), publicBaseURL)
+	workerCount := uploadWorkerCount(len(files))
+	if api.shouldSerializeUploads(r.Context(), group) {
+		workerCount = 1
+	}
+	if workerCount > 1 {
+		var wg sync.WaitGroup
+		jobs := make(chan int)
+		for range workerCount {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for index := range jobs {
+					items[index] = api.handleUploadFile(r.Context(), actorPtr, group, files[index], clientAddr, r.UserAgent(), publicBaseURL)
+				}
+			}()
+		}
+		for index := range files {
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+	} else {
+		for index, header := range files {
+			items[index] = api.handleUploadFile(r.Context(), actorPtr, group, header, clientAddr, r.UserAgent(), publicBaseURL)
+		}
+	}
+	for _, item := range items {
 		if item.Success {
 			successes++
 		}
-		items = append(items, item)
 	}
 
 	status := http.StatusCreated
@@ -1712,11 +1730,11 @@ func decodeTempImage(file *os.File) (int, int, bool) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return 0, 0, false
 	}
-	content, err := io.ReadAll(file)
+	cfg, _, err := image.DecodeConfig(file)
 	if err != nil {
 		return 0, 0, false
 	}
-	return resource.DecodeImageConfig(content)
+	return cfg.Width, cfg.Height, true
 }
 
 func shouldValidateImage(extension, contentType string) bool {
@@ -1743,6 +1761,31 @@ func firstUploadStatus(items []uploadItemResponse, fallback int) int {
 	return fallback
 }
 
+func uploadWorkerCount(fileCount int) int {
+	if fileCount <= 1 {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 2 {
+		workers = 2
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	if workers > fileCount {
+		workers = fileCount
+	}
+	return workers
+}
+
+func (api *API) shouldSerializeUploads(ctx context.Context, group string) bool {
+	groupConfig, err := api.userGroupByID(ctx, group)
+	if err != nil {
+		return true
+	}
+	return groupConfig.TotalCapacityBytes > 0 || groupConfig.DailyUploadLimit > 0
+}
+
 func parseIntDefault(raw string, fallback int) int {
 	if raw == "" {
 		return fallback
@@ -1752,20 +1795,6 @@ func parseIntDefault(raw string, fallback int) int {
 		return fallback
 	}
 	return parsed
-}
-
-func clientIP(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
-		}
-	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
 }
 
 type loginRequest struct {
@@ -1818,14 +1847,7 @@ func (api *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	api.loginFailureLimiter.Reset(clientAddr)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    session.Token,
-		Path:     "/",
-		Expires:  session.ExpiresAt,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	setSessionCookie(w, r, session.Token, session.ExpiresAt)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user":      session.User,
 		"expiresAt": session.ExpiresAt,
@@ -1837,14 +1859,7 @@ func (api *API) logout(w http.ResponseWriter, r *http.Request) {
 		api.app.Auth.Logout(cookie.Value)
 	}
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

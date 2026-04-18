@@ -94,6 +94,7 @@
   let siteSettingsForm: SiteSettings = defaultSiteSettings();
   let installState: InstallState | null = null;
   let installReady = false;
+  let installLoadError = '';
   let currentUser: AuthUser | null = null;
   let authReady = false;
   let bootstrapReady = false;
@@ -253,12 +254,14 @@
   async function handleRouteChange() {
     const route = resolveRouteState(path);
     const token = ++routeLoadToken;
+    const initialized = installState?.initialized || !!currentUser;
+    const knownUninitialized = installReady && installState?.initialized === false && !currentUser;
 
-    if (!installState?.initialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) {
+    if (knownUninitialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) {
       await navigate('/install', true);
       return;
     }
-    if (installState?.initialized && path === '/install') {
+    if (initialized && path === '/install') {
       await navigate(currentUser ? (currentUser.role === 'admin' ? '/admin' : '/account') : '/login', true);
       return;
     }
@@ -296,8 +299,13 @@
     return runDeduped('install', async () => {
       try {
         const res = await fetch('/api/v1/install/state');
-        if (!res.ok) return;
-        const payload = await res.json() as InstallState;
+        const payload = await readJSON(res) as InstallState & { error?: string; detail?: string };
+        if (!res.ok) {
+          installLoadError = payload.error ?? payload.detail ?? '加载初始化状态失败';
+          installState = null;
+          return;
+        }
+        installLoadError = '';
         installState = payload;
         siteName = payload.siteName || siteName;
         installForm.siteName = payload.siteName || installForm.siteName;
@@ -420,12 +428,13 @@
 
   async function initializeSite() {
     installError = '';
+    if (installLoadError) return void (installError = installLoadError);
     if (installForm.password.length < 8) return void (installError = '密码至少需要 8 位。');
     if (installForm.password !== installForm.confirmPassword) return void (installError = '两次输入的密码不一致。');
     isInitializing = true;
     try {
       const res = await fetch('/api/v1/install/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ siteName: installForm.siteName, defaultStorage: installForm.defaultStorage, adminUsername: installForm.adminUsername, displayName: installForm.displayName, password: installForm.password }) });
-      const payload = await res.json();
+      const payload = await readJSON(res);
       if (!res.ok) return void (installError = payload.error ?? '初始化失败');
       currentUser = payload.user;
       invalidateCache('install', 'currentUser', 'homeStats', 'siteSettings');
@@ -440,7 +449,7 @@
   }
 
   async function login() {
-    if (!installState?.initialized) return jump('/install');
+    if (installReady && installState?.initialized === false && !currentUser) return jump('/install');
     isLoggingIn = true;
     loginError = '';
     try {
@@ -802,6 +811,7 @@
     done(window.isSecureContext ? '复制失败，请手动复制。' : '当前为 HTTP 环境，系统剪贴板受限，请手动复制。');
   }
   function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = value; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`; }
+  async function readJSON(res: Response) { try { return await res.json(); } catch { return { error: res.ok ? '' : `请求失败：HTTP ${res.status}` }; } }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
   function groupLabel(value: string) { return groupLabels[value] ?? value; }
@@ -873,7 +883,7 @@
         <label>昵称<input bind:value={installForm.displayName} /></label>
         <label>密码<input bind:value={installForm.password} type="password" autocomplete="new-password" /></label>
         <label>确认密码<input bind:value={installForm.confirmPassword} type="password" autocomplete="new-password" /></label>
-        {#if installError}<p class="form-error">{installError}</p>{/if}
+        {#if installError || installLoadError}<p class="form-error">{installError || installLoadError}</p>{/if}
         <button class="button primary" type="submit" disabled={isInitializing || !installReady}>{isInitializing ? '初始化中' : '创建管理员'}</button>
       </form>
     </section>

@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"sync"
@@ -16,6 +18,8 @@ const (
 	defaultUploadWindow       = time.Minute
 	defaultLoginFailureLimit  = 5
 	defaultLoginFailureWindow = 10 * time.Minute
+	defaultJSONBodyLimit      = 1 << 20
+	maxRateLimitEntries       = 8192
 )
 
 type fixedWindowRateLimiter struct {
@@ -80,6 +84,7 @@ func (l *fixedWindowRateLimiter) Reset(key string) {
 }
 
 func (l *fixedWindowRateLimiter) currentEntryLocked(key string, now time.Time) rateLimitEntry {
+	l.pruneExpiredLocked(now)
 	entry, ok := l.entries[key]
 	if !ok || !now.Before(entry.resetAt) {
 		entry = rateLimitEntry{
@@ -87,6 +92,26 @@ func (l *fixedWindowRateLimiter) currentEntryLocked(key string, now time.Time) r
 		}
 	}
 	return entry
+}
+
+func (l *fixedWindowRateLimiter) pruneExpiredLocked(now time.Time) {
+	if len(l.entries) == 0 {
+		return
+	}
+	for key, entry := range l.entries {
+		if !now.Before(entry.resetAt) {
+			delete(l.entries, key)
+		}
+	}
+	if len(l.entries) <= maxRateLimitEntries {
+		return
+	}
+	for key := range l.entries {
+		delete(l.entries, key)
+		if len(l.entries) <= maxRateLimitEntries {
+			return
+		}
+	}
 }
 
 func sanitizeUploadFilename(filename string) string {
@@ -198,6 +223,146 @@ func applyResourceSecurityHeaders(w http.ResponseWriter, record resource.Record)
 		w.Header().Set("Content-Security-Policy", "sandbox")
 		w.Header().Set("X-Frame-Options", "DENY")
 	}
+}
+
+func secureMiddleware(next http.Handler) http.Handler {
+	return securityHeadersMiddleware(limitRequestBodyMiddleware(originGuardMiddleware(next)))
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		if h.Get("X-Content-Type-Options") == "" {
+			h.Set("X-Content-Type-Options", "nosniff")
+		}
+		if h.Get("Referrer-Policy") == "" {
+			h.Set("Referrer-Policy", "same-origin")
+		}
+		if h.Get("X-Frame-Options") == "" {
+			h.Set("X-Frame-Options", "DENY")
+		}
+		if h.Get("Permissions-Policy") == "" {
+			h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func limitRequestBodyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isUnsafeMethod(r.Method) && r.URL.Path != "/api/v1/resources/upload" {
+			r.Body = http.MaxBytesReader(w, r.Body, defaultJSONBodyLimit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func originGuardMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isUnsafeMethod(r.Method) && !hasSameOrigin(r) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-origin request rejected"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isUnsafeMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func hasSameOrigin(r *http.Request) bool {
+	source := strings.TrimSpace(r.Header.Get("Origin"))
+	if source == "" {
+		source = strings.TrimSpace(r.Header.Get("Referer"))
+	}
+	if source == "" {
+		return true
+	}
+	sourceURL, err := url.Parse(source)
+	if err != nil || sourceURL.Host == "" {
+		return false
+	}
+	return strings.EqualFold(sourceURL.Host, requestHost(r))
+}
+
+func requestHost(r *http.Request) string {
+	if forwardedHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" && requestFromTrustedProxy(r) {
+		return strings.Split(forwardedHost, ",")[0]
+	}
+	return r.Host
+}
+
+func clientIP(r *http.Request) string {
+	if requestFromTrustedProxy(r) {
+		if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			if len(parts) > 0 {
+				if ip := strings.TrimSpace(parts[0]); ip != "" {
+					return ip
+				}
+			}
+		}
+		if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+			return realIP
+		}
+	}
+	return remoteIP(r)
+}
+
+func requestFromTrustedProxy(r *http.Request) bool {
+	ip := net.ParseIP(remoteIP(r))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
+
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil {
+		return host
+	}
+	return strings.TrimSpace(r.RemoteAddr)
+}
+
+func setSessionCookie(w http.ResponseWriter, r *http.Request, value string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    value,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsHTTPS(r),
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   requestIsHTTPS(r),
+	})
+}
+
+func requestIsHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if requestFromTrustedProxy(r) {
+		return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	}
+	return false
 }
 
 func max(a, b int) int {

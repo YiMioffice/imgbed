@@ -184,6 +184,49 @@ func TestLoginFailureRateLimit(t *testing.T) {
 	}
 }
 
+func TestLoginRateLimitIgnoresSpoofedForwardedForFromUntrustedClient(t *testing.T) {
+	api := testAPI(t, true)
+	api.loginFailureLimiter = newFixedWindowRateLimiter(2, time.Hour)
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"wrong"}`))
+	firstReq.RemoteAddr = "203.0.113.10:1234"
+	firstReq.Header.Set("X-Forwarded-For", "198.51.100.1")
+	firstRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusUnauthorized {
+		t.Fatalf("first login status = %d, want %d; body: %s", firstRec.Code, http.StatusUnauthorized, firstRec.Body.String())
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"wrong"}`))
+	secondReq.RemoteAddr = "203.0.113.10:1234"
+	secondReq.Header.Set("X-Forwarded-For", "198.51.100.2")
+	secondRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second login status = %d, want %d; body: %s", secondRec.Code, http.StatusTooManyRequests, secondRec.Body.String())
+	}
+}
+
+func TestSessionCookieIsSecureBehindTrustedHTTPSProxy(t *testing.T) {
+	api := testAPI(t, true)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"secret"}`))
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("session cookie was not set: %#v", cookies)
+	}
+	if !cookies[0].Secure {
+		t.Fatalf("secure cookie = false, want true")
+	}
+}
+
 func TestUploadCreatesResourceAndServesDirectLink(t *testing.T) {
 	api := testAPI(t, true)
 	var body bytes.Buffer
@@ -236,6 +279,33 @@ func TestUploadCreatesResourceAndServesDirectLink(t *testing.T) {
 	}
 	if !bytes.Equal(fileRec.Body.Bytes(), tinyPNG) {
 		t.Fatalf("served body mismatch: %v", fileRec.Body.Bytes())
+	}
+}
+
+func TestRawAssetRouteDoesNotBypassResourcePolicy(t *testing.T) {
+	api := testAPI(t, true)
+	resourceID := uploadTestPNG(t, api)
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, detailReq)
+	detailRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d; body: %s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+
+	var payload struct {
+		Detail resource.Detail `json:"detail"`
+	}
+	if err := json.NewDecoder(detailRec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+
+	rawReq := httptest.NewRequest(http.MethodGet, "/assets/"+payload.Detail.Record.ObjectKey, nil)
+	rawRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(rawRec, rawReq)
+	if rawRec.Code != http.StatusNotFound {
+		t.Fatalf("raw asset status = %d, want %d; body: %s", rawRec.Code, http.StatusNotFound, rawRec.Body.String())
 	}
 }
 

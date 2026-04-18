@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,7 +23,10 @@ func NewLocal(root, publicBaseURL string) *Local {
 }
 
 func (s *Local) Put(_ context.Context, key string, reader io.Reader) (Object, error) {
-	target := filepath.Join(s.root, filepath.FromSlash(key))
+	target, err := s.localPath(key)
+	if err != nil {
+		return Object{}, err
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return Object{}, err
 	}
@@ -44,7 +48,11 @@ func (s *Local) Put(_ context.Context, key string, reader io.Reader) (Object, er
 }
 
 func (s *Local) Open(_ context.Context, key string) (io.ReadCloser, error) {
-	return os.Open(filepath.Join(s.root, filepath.FromSlash(key)))
+	target, err := s.localPath(key)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(target)
 }
 
 func (s *Local) Get(ctx context.Context, key string) (io.ReadCloser, error) {
@@ -52,11 +60,19 @@ func (s *Local) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 }
 
 func (s *Local) Delete(_ context.Context, key string) error {
-	return os.Remove(filepath.Join(s.root, filepath.FromSlash(key)))
+	target, err := s.localPath(key)
+	if err != nil {
+		return err
+	}
+	return os.Remove(target)
 }
 
 func (s *Local) Stat(_ context.Context, key string) (Stat, error) {
-	info, err := os.Stat(filepath.Join(s.root, filepath.FromSlash(key)))
+	target, err := s.localPath(key)
+	if err != nil {
+		return Stat{}, err
+	}
+	info, err := os.Stat(target)
 	if err != nil {
 		return Stat{}, err
 	}
@@ -84,4 +100,31 @@ func (s *Local) PublicURL(key string) string {
 
 func (s *Local) HealthCheck(_ context.Context) error {
 	return os.MkdirAll(s.root, 0o755)
+}
+
+func (s *Local) localPath(key string) (string, error) {
+	key = strings.TrimLeft(strings.ReplaceAll(strings.TrimSpace(key), "\\", "/"), "/")
+	if key == "" {
+		return "", errors.New("storage key is required")
+	}
+	clean := filepath.Clean(filepath.FromSlash(key))
+	if clean == "." || clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", errors.New("invalid storage key")
+	}
+	root, err := filepath.Abs(s.root)
+	if err != nil {
+		return "", err
+	}
+	target, err := filepath.Abs(filepath.Join(root, clean))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", errors.New("invalid storage key")
+	}
+	return target, nil
 }
