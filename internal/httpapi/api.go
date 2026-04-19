@@ -1607,6 +1607,32 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to resolve resource storage", err))
 		return
 	}
+	contentDisposition := ""
+	if shouldForceAttachment(record, decision.Rule.DownloadDisposition) {
+		contentDisposition = fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(record.OriginalName))
+	}
+	if r.Method == http.MethodGet {
+		if redirector, ok := resourceStore.(storage.Redirector); ok {
+			redirectURL, err := redirector.RedirectURL(r.Context(), record.ObjectKey, storage.RedirectOptions{
+				Method:             http.MethodGet,
+				Expires:            5 * time.Minute,
+				ContentType:        record.ContentType,
+				CacheControl:       decision.Rule.CacheControl,
+				ContentDisposition: contentDisposition,
+			})
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorPayload("failed to generate storage redirect", err))
+				return
+			}
+			if plannedBytes > 0 {
+				api.addResourceTraffic(r.Context(), record, viewer, hasViewer, plannedBytes, countAccess)
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Location", redirectURL)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+	}
 	file, err := resourceStore.Get(r.Context(), record.ObjectKey)
 	if err != nil {
 		http.NotFound(w, r)
@@ -1621,8 +1647,8 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 	if decision.Rule.CacheControl != "" {
 		w.Header().Set("Cache-Control", decision.Rule.CacheControl)
 	}
-	if shouldForceAttachment(record, decision.Rule.DownloadDisposition) {
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(record.OriginalName)))
+	if contentDisposition != "" {
+		w.Header().Set("Content-Disposition", contentDisposition)
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	status := http.StatusOK
@@ -1650,25 +1676,31 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var written int64
-	var copyErr error
 	if hasRange {
-		written, copyErr = io.CopyN(w, file, contentLength)
+		written, _ = io.CopyN(w, file, contentLength)
 	} else {
-		written, copyErr = io.Copy(w, file)
+		written, _ = io.Copy(w, file)
 	}
-	if copyErr == nil {
-		userID := ""
-		if hasViewer {
-			userID = viewer.ID
-		}
-		_, _ = api.app.Data.AddResourceTraffic(r.Context(), persist.AddTrafficParams{
-			ResourceID:      record.ID,
-			UserID:          userID,
-			Bytes:           written,
-			SkipAccessCount: !countAccess,
-			AccessedAt:      time.Now(),
-		})
+	if written > 0 {
+		api.addResourceTraffic(r.Context(), record, viewer, hasViewer, written, countAccess)
 	}
+}
+
+func (api *API) addResourceTraffic(ctx context.Context, record resource.Record, viewer auth.User, hasViewer bool, bytes int64, countAccess bool) {
+	if bytes <= 0 {
+		return
+	}
+	userID := ""
+	if hasViewer {
+		userID = viewer.ID
+	}
+	_, _ = api.app.Data.AddResourceTraffic(ctx, persist.AddTrafficParams{
+		ResourceID:      record.ID,
+		UserID:          userID,
+		Bytes:           bytes,
+		SkipAccessCount: !countAccess,
+		AccessedAt:      time.Now(),
+	})
 }
 
 func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group string, header *multipart.FileHeader, uploadIP, userAgent, publicBaseURL string) uploadItemResponse {

@@ -1387,8 +1387,10 @@ func (s *SQLiteStore) ResourceDetail(ctx context.Context, id string) (resource.D
 	}
 
 	detail := resource.Detail{
-		Record: record,
-		Links:  resource.BuildLinks(record.OriginalName, record.PublicURL, record.Type),
+		Record:         record,
+		Variants:       []resource.Variant{},
+		Links:          resource.BuildLinks(record.OriginalName, record.PublicURL, record.Type),
+		TrafficWindows: []resource.TrafficWindow{},
 	}
 	if metadata, err := s.resourceMetadata(ctx, id); err == nil {
 		detail.Metadata = metadata
@@ -1400,11 +1402,17 @@ func (s *SQLiteStore) ResourceDetail(ctx context.Context, id string) (resource.D
 		return resource.Detail{}, err
 	}
 	detail.Variants = variants
+	if detail.Variants == nil {
+		detail.Variants = []resource.Variant{}
+	}
 	windows, err := s.resourceTrafficWindows(ctx, id)
 	if err != nil {
 		return resource.Detail{}, err
 	}
 	detail.TrafficWindows = windows
+	if detail.TrafficWindows == nil {
+		detail.TrafficWindows = []resource.TrafficWindow{}
+	}
 	return detail, nil
 }
 

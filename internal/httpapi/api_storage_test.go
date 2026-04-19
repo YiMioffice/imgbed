@@ -92,11 +92,38 @@ func TestS3CompatibleStorageUploadAndServe(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/r/"+resourceID, nil)
 	rec := httptest.NewRecorder()
 	api.Routes().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("serve status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("serve status = %d, want %d; body: %s", rec.Code, http.StatusFound, rec.Body.String())
 	}
-	if !bytes.Equal(rec.Body.Bytes(), tinyPNG) {
-		t.Fatalf("served body mismatch: %v", rec.Body.Bytes())
+	redirectLocation := rec.Header().Get("Location")
+	if !strings.HasPrefix(redirectLocation, server.URL()+"/assets/uploads/") {
+		t.Fatalf("redirect location = %q, want s3 object URL prefix %q", redirectLocation, server.URL()+"/assets/uploads/")
+	}
+	if !strings.Contains(redirectLocation, "X-Amz-Signature=") {
+		t.Fatalf("redirect location is not presigned: %q", redirectLocation)
+	}
+	if !strings.Contains(redirectLocation, "response-content-type=image%2Fpng") {
+		t.Fatalf("redirect location does not preserve content type: %q", redirectLocation)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, detailReq)
+	detailRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d; body: %s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+	var detailPayload struct {
+		Detail resource.Detail `json:"detail"`
+	}
+	if err := json.NewDecoder(detailRec.Body).Decode(&detailPayload); err != nil {
+		t.Fatal(err)
+	}
+	if detailPayload.Detail.Record.TrafficBytes != int64(len(tinyPNG)) {
+		t.Fatalf("s3 traffic bytes = %d, want %d", detailPayload.Detail.Record.TrafficBytes, len(tinyPNG))
+	}
+	if detailPayload.Detail.Record.AccessCount != 1 {
+		t.Fatalf("s3 access count = %d, want 1", detailPayload.Detail.Record.AccessCount)
 	}
 }
 

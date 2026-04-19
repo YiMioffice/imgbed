@@ -759,6 +759,9 @@ func TestResourceDetailIncludesImageMetadata(t *testing.T) {
 	if payload.Detail.Links.Direct == "" || len(payload.Detail.Variants) == 0 {
 		t.Fatalf("detail links/variants missing: %#v", payload.Detail)
 	}
+	if payload.Detail.TrafficWindows == nil {
+		t.Fatal("traffic windows should be an empty array, got null")
+	}
 }
 
 func TestAuthenticatedTrafficIsAggregatedByUser(t *testing.T) {

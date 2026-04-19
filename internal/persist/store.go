@@ -356,6 +356,12 @@ func (s *Store) ResourceDetail(_ context.Context, id string) (resource.Detail, e
 		TrafficWindows: s.trafficWindowsLocked(id),
 		Links:          resource.BuildLinks(record.OriginalName, record.PublicURL, record.Type),
 	}
+	if detail.Variants == nil {
+		detail.Variants = []resource.Variant{}
+	}
+	if detail.TrafficWindows == nil {
+		detail.TrafficWindows = []resource.TrafficWindow{}
+	}
 	return detail, nil
 }
 

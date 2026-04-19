@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 )
 
 const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+const unsignedPayload = "UNSIGNED-PAYLOAD"
 
 type S3 struct {
 	cfg      persist.StorageConfig
@@ -165,14 +167,63 @@ func (s *S3) PublicURL(key string) string {
 	if base := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/"); base != "" {
 		return base + "/" + strings.TrimLeft(key, "/")
 	}
-	u := *s.endpoint
-	if s.cfg.UsePathStyle {
-		u.Path = joinURLPath(u.Path, s.cfg.Bucket, key)
-		return u.String()
-	}
-	u.Host = s.cfg.Bucket + "." + u.Host
-	u.Path = joinURLPath(u.Path, key)
+	u := s.objectURL(key)
 	return u.String()
+}
+
+func (s *S3) RedirectURL(ctx context.Context, key string, options RedirectOptions) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	method := strings.ToUpper(strings.TrimSpace(options.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	expires := options.Expires
+	if expires <= 0 {
+		expires = 5 * time.Minute
+	}
+	if expires > 7*24*time.Hour {
+		expires = 7 * 24 * time.Hour
+	}
+
+	targetURL := s.objectURL(JoinBasePath(s.cfg.BasePath, key))
+	query := targetURL.Query()
+	now := time.Now().UTC()
+	shortDate := now.Format("20060102")
+	scope := shortDate + "/" + s.cfg.Region + "/s3/aws4_request"
+	query.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	query.Set("X-Amz-Credential", s.cfg.AccessKeyID+"/"+scope)
+	query.Set("X-Amz-Date", now.Format("20060102T150405Z"))
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	query.Set("X-Amz-SignedHeaders", "host")
+	if strings.TrimSpace(options.ContentType) != "" {
+		query.Set("response-content-type", strings.TrimSpace(options.ContentType))
+	}
+	if strings.TrimSpace(options.CacheControl) != "" {
+		query.Set("response-cache-control", strings.TrimSpace(options.CacheControl))
+	}
+	if strings.TrimSpace(options.ContentDisposition) != "" {
+		query.Set("response-content-disposition", strings.TrimSpace(options.ContentDisposition))
+	}
+	targetURL.RawQuery = query.Encode()
+	canonicalRequest := strings.Join([]string{
+		method,
+		canonicalURI(&targetURL),
+		canonicalQuery(&targetURL),
+		"host:" + targetURL.Host + "\n",
+		"host",
+		unsignedPayload,
+	}, "\n")
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		now.Format("20060102T150405Z"),
+		scope,
+		sha256HexString(canonicalRequest),
+	}, "\n")
+	signature := hex.EncodeToString(hmacSHA256(signingKey(s.cfg.SecretAccessKey, shortDate, s.cfg.Region, "s3"), stringToSign))
+	targetURL.RawQuery = canonicalQuery(&targetURL) + "&X-Amz-Signature=" + signature
+	return targetURL.String(), nil
 }
 
 func (s *S3) HealthCheck(ctx context.Context) error {
@@ -219,15 +270,19 @@ func (s *S3) objectProbe(ctx context.Context) error {
 }
 
 func (s *S3) newObjectRequest(ctx context.Context, method, key string, body io.Reader, payloadHash string) (*http.Request, error) {
+	targetURL := s.objectURL(JoinBasePath(s.cfg.BasePath, key))
+	return s.newSignedRequest(ctx, method, &targetURL, body, payloadHash)
+}
+
+func (s *S3) objectURL(key string) url.URL {
 	targetURL := *s.endpoint
-	key = JoinBasePath(s.cfg.BasePath, key)
 	if s.cfg.UsePathStyle {
 		targetURL.Path = joinURLPath(targetURL.Path, s.cfg.Bucket, key)
-	} else {
-		targetURL.Host = s.cfg.Bucket + "." + targetURL.Host
-		targetURL.Path = joinURLPath(targetURL.Path, key)
+		return targetURL
 	}
-	return s.newSignedRequest(ctx, method, &targetURL, body, payloadHash)
+	targetURL.Host = s.cfg.Bucket + "." + targetURL.Host
+	targetURL.Path = joinURLPath(targetURL.Path, key)
+	return targetURL
 }
 
 func (s *S3) newBucketRequest(ctx context.Context, method string, body io.Reader, payloadHash string) (*http.Request, error) {

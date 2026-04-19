@@ -756,7 +756,16 @@
     });
   }
 
-  async function loadResourceDetail(id: string, force = false) { if (!id) return; if (!force && resourceDetail?.record.id === id && isFresh(resourceDetailCacheTimestamps.get(id) ?? 0, cacheTTL.resourceDetail)) return; isLoadingDetail = true; detailError = ''; signedLinkResult = null; return runDeduped(`resourceDetail:${id}`, async () => { try { const res = await fetch(`/api/v1/resources/${encodeURIComponent(id)}`); const payload = await res.json(); if (!res.ok) return void (detailError = payload.error ?? '加载资源详情失败'); resourceDetail = payload.detail; resourceDetailCacheTimestamps.set(id, Date.now()); } catch (error) { detailError = error instanceof Error ? error.message : '加载资源详情失败'; } finally { isLoadingDetail = false; } }); }
+  async function loadResourceDetail(id: string, force = false) { if (!id) return; if (!force && resourceDetail?.record.id === id && isFresh(resourceDetailCacheTimestamps.get(id) ?? 0, cacheTTL.resourceDetail)) return; isLoadingDetail = true; detailError = ''; signedLinkResult = null; return runDeduped(`resourceDetail:${id}`, async () => { try { const res = await fetch(`/api/v1/resources/${encodeURIComponent(id)}`); const payload = await res.json(); if (!res.ok) return void (detailError = payload.error ?? '加载资源详情失败'); if (!payload.detail?.record) return void (detailError = '资源详情响应缺少记录。'); resourceDetail = normalizeResourceDetail(payload.detail); resourceDetailCacheTimestamps.set(id, Date.now()); } catch (error) { detailError = error instanceof Error ? error.message : '加载资源详情失败'; } finally { isLoadingDetail = false; } }); }
+  function normalizeResourceDetail(detail: ResourceDetail): ResourceDetail {
+    return {
+      ...detail,
+      metadata: detail.metadata ?? { resourceId: detail.record.id, headerSha256: '', imageWidth: 0, imageHeight: 0, imageDecoded: false },
+      variants: Array.isArray(detail.variants) ? detail.variants : [],
+      links: detail.links ?? { direct: detail.record.publicUrl, markdown: '', html: '', bbcode: '' },
+      trafficWindows: Array.isArray(detail.trafficWindows) ? detail.trafficWindows : []
+    };
+  }
   async function mutateResource(url: string, method: string, successMessage: string) {
     resourceError = '';
     resourceMessage = '';
@@ -1582,7 +1591,7 @@
       <div class="home-copy">
         <p class="eyebrow">马赫环静态托管</p>
         <h1>{siteName}</h1>
-        <p class="lead">统一托管图片、脚本、压缩包、可执行文件与其他静态资源，首页统计直接读取真实资源与流量数据。</p>
+        <p class="lead">统一托管图片、脚本、压缩包、可执行文件与其他静态资源，大陆优化网络，免登录上传。</p>
         <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}{#if !currentUser || currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>后台</a>{/if}{:else}<a class="button primary" href="/install">初始化</a>{/if}</div>
       </div>
       {#if siteSettings.showStatsOnHome}

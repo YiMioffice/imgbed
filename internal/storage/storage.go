@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"io"
+	"time"
 )
 
 type Object struct {
@@ -26,4 +27,16 @@ type Store interface {
 	Exists(ctx context.Context, key string) (bool, error)
 	PublicURL(key string) string
 	HealthCheck(ctx context.Context) error
+}
+
+type RedirectOptions struct {
+	Method             string
+	Expires            time.Duration
+	ContentType        string
+	CacheControl       string
+	ContentDisposition string
+}
+
+type Redirector interface {
+	RedirectURL(ctx context.Context, key string, options RedirectOptions) (string, error)
 }
