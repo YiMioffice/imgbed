@@ -51,6 +51,8 @@ type UserGroup struct {
 	MaxFileSizeBytes           int64     `json:"maxFileSizeBytes"`
 	DailyUploadLimit           int       `json:"dailyUploadLimit"`
 	AllowHotlink               bool      `json:"allowHotlink"`
+	ImageCompressionEnabled    bool      `json:"imageCompressionEnabled"`
+	ImageCompressionQuality    int       `json:"imageCompressionQuality"`
 	CreatedAt                  time.Time `json:"createdAt"`
 	UpdatedAt                  time.Time `json:"updatedAt"`
 }
@@ -115,10 +117,11 @@ type FeaturedResource struct {
 }
 
 type AddTrafficParams struct {
-	ResourceID string
-	UserID     string
-	Bytes      int64
-	AccessedAt time.Time
+	ResourceID      string
+	UserID          string
+	Bytes           int64
+	SkipAccessCount bool
+	AccessedAt      time.Time
 }
 
 type DataStore interface {
@@ -376,6 +379,13 @@ func (s *Store) MarkResourceDeleted(_ context.Context, id string) (resource.Reco
 		record.Status = resource.StatusDeleted
 		record.DeletedAt = now
 		record.UpdatedAt = now
+		filtered := s.data.Featured[:0]
+		for _, item := range s.data.Featured {
+			if item.Resource.ID != id {
+				filtered = append(filtered, item)
+			}
+		}
+		s.data.Featured = filtered
 	})
 }
 
@@ -400,13 +410,15 @@ func (s *Store) AddResourceTraffic(_ context.Context, params AddTrafficParams) (
 			record.MonthWindow = monthKey
 			record.MonthlyTraffic = 0
 		}
-		record.AccessCount++
+		if !params.SkipAccessCount {
+			record.AccessCount++
+		}
 		record.TrafficBytes += params.Bytes
 		record.MonthlyTraffic += params.Bytes
 		record.UpdatedAt = params.AccessedAt
 
-		s.bumpTrafficWindowLocked(record.ID, params.UserID, record.Type, "day", dayKey, params.Bytes, params.AccessedAt)
-		s.bumpTrafficWindowLocked(record.ID, params.UserID, record.Type, "month", monthKey, params.Bytes, params.AccessedAt)
+		s.bumpTrafficWindowLocked(record.ID, params.UserID, record.Type, "day", dayKey, params.Bytes, !params.SkipAccessCount, params.AccessedAt)
+		s.bumpTrafficWindowLocked(record.ID, params.UserID, record.Type, "month", monthKey, params.Bytes, !params.SkipAccessCount, params.AccessedAt)
 	})
 }
 
@@ -453,7 +465,11 @@ func (s *Store) ResourceStats(_ context.Context) (resource.Stats, error) {
 func (s *Store) UserGroups(_ context.Context) ([]UserGroup, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return slices.Clone(s.data.Groups), nil
+	groups := slices.Clone(s.data.Groups)
+	for i := range groups {
+		groups[i] = normalizeUserGroup(groups[i])
+	}
+	return groups, nil
 }
 
 func (s *Store) UpdateUserGroup(_ context.Context, group UserGroup) (UserGroup, error) {
@@ -461,12 +477,14 @@ func (s *Store) UpdateUserGroup(_ context.Context, group UserGroup) (UserGroup, 
 	defer s.mu.Unlock()
 	for i := range s.data.Groups {
 		if s.data.Groups[i].ID == group.ID {
+			group = normalizeUserGroup(group)
 			group.CreatedAt = s.data.Groups[i].CreatedAt
 			group.UpdatedAt = time.Now()
 			s.data.Groups[i] = group
 			return group, s.saveLocked()
 		}
 	}
+	group = normalizeUserGroup(group)
 	group.CreatedAt = time.Now()
 	group.UpdatedAt = group.CreatedAt
 	s.data.Groups = append(s.data.Groups, group)
@@ -481,7 +499,7 @@ func (s *Store) UserUsage(_ context.Context, userID string) (UserUsage, error) {
 			usage := UserUsage{User: user}
 			for _, group := range s.data.Groups {
 				if group.ID == user.GroupID {
-					usage.Group = group
+					usage.Group = normalizeUserGroup(group)
 					break
 				}
 			}
@@ -709,11 +727,15 @@ func (s *Store) upsertVariantLocked(variant resource.Variant) {
 	s.data.Variants = append(s.data.Variants, variant)
 }
 
-func (s *Store) bumpTrafficWindowLocked(resourceID, userID string, resourceType resource.Type, windowType, windowKey string, bytes int64, accessedAt time.Time) {
+func (s *Store) bumpTrafficWindowLocked(resourceID, userID string, resourceType resource.Type, windowType, windowKey string, bytes int64, countAccess bool, accessedAt time.Time) {
+	requestCount := int64(0)
+	if countAccess {
+		requestCount = 1
+	}
 	for i := range s.data.TrafficWindows {
 		item := &s.data.TrafficWindows[i]
 		if item.ResourceID == resourceID && item.UserID == userID && item.WindowType == windowType && item.WindowKey == windowKey {
-			item.RequestCount++
+			item.RequestCount += requestCount
 			item.TrafficBytes += bytes
 			item.UpdatedAt = accessedAt
 			return
@@ -725,7 +747,7 @@ func (s *Store) bumpTrafficWindowLocked(resourceID, userID string, resourceType 
 		ResourceType: resourceType,
 		WindowType:   windowType,
 		WindowKey:    windowKey,
-		RequestCount: 1,
+		RequestCount: requestCount,
 		TrafficBytes: bytes,
 		UpdatedAt:    accessedAt,
 	})
@@ -826,6 +848,20 @@ func paginateResources(records []resource.Record, page, pageSize int) resource.L
 		PageSize:   pageSize,
 		TotalPages: totalPages,
 	}
+}
+
+func normalizeUserGroup(group UserGroup) UserGroup {
+	if group.ImageCompressionQuality == 0 {
+		group.ImageCompressionQuality = 50
+		group.ImageCompressionEnabled = true
+	}
+	if group.ImageCompressionQuality < 50 {
+		group.ImageCompressionQuality = 50
+	}
+	if group.ImageCompressionQuality > 80 {
+		group.ImageCompressionQuality = 80
+	}
+	return group
 }
 
 func dayBoundsUTC(now time.Time) (time.Time, time.Time) {

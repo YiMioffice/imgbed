@@ -48,6 +48,24 @@ func DefaultRules() []Rule {
 			DownloadDisposition:            "attachment",
 		},
 		{
+			UserGroup:                      GroupGuest,
+			ResourceType:                   resource.TypeVideo,
+			AllowUpload:                    true,
+			AllowAccess:                    true,
+			MaxFileSizeBytes:               200 * MB,
+			MonthlyTrafficPerResourceBytes: 5 * GB,
+			CacheControl:                   "public, max-age=86400",
+		},
+		{
+			UserGroup:                      GroupUser,
+			ResourceType:                   resource.TypeVideo,
+			AllowUpload:                    true,
+			AllowAccess:                    true,
+			MaxFileSizeBytes:               1024 * MB,
+			MonthlyTrafficPerResourceBytes: 20 * GB,
+			CacheControl:                   "public, max-age=86400",
+		},
+		{
 			UserGroup:           GroupUser,
 			ResourceType:        resource.TypeExecutable,
 			AllowUpload:         false,
@@ -70,6 +88,15 @@ func DefaultRules() []Rule {
 			AllowAccess:                    true,
 			MaxFileSizeBytes:               500 * MB,
 			MonthlyTrafficPerResourceBytes: 20 * GB,
+		},
+		{
+			UserGroup:                      GroupAdmin,
+			ResourceType:                   resource.TypeVideo,
+			AllowUpload:                    true,
+			AllowAccess:                    true,
+			MaxFileSizeBytes:               2 * GB,
+			MonthlyTrafficPerResourceBytes: 50 * GB,
+			CacheControl:                   "public, max-age=86400",
 		},
 	}
 }

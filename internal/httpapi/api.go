@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -32,6 +34,7 @@ type API struct {
 	app                 *app.App
 	uploadLimiter       *fixedWindowRateLimiter
 	loginFailureLimiter *fixedWindowRateLimiter
+	compressionLimiter  chan struct{}
 }
 
 const sessionCookieName = "machring_session"
@@ -41,6 +44,7 @@ func New(app *app.App) *API {
 		app:                 app,
 		uploadLimiter:       newFixedWindowRateLimiter(defaultUploadRequestLimit, defaultUploadWindow),
 		loginFailureLimiter: newFixedWindowRateLimiter(defaultLoginFailureLimit, defaultLoginFailureWindow),
+		compressionLimiter:  make(chan struct{}, compressionWorkerLimit()),
 	}
 }
 
@@ -88,6 +92,7 @@ func (api *API) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/resources/{id}/restore", api.restoreResource)
 	mux.HandleFunc("POST /api/v1/resources/upload", api.uploadResource)
 	mux.HandleFunc("GET /api/v1/stats/overview", api.statsOverview)
+	mux.HandleFunc("HEAD /r/{id}", api.serveResource)
 	mux.HandleFunc("GET /r/{id}", api.serveResource)
 	return secureMiddleware(mux)
 }
@@ -563,14 +568,23 @@ type uploadError struct {
 }
 
 type uploadItemResponse struct {
-	Success  bool              `json:"success"`
-	Status   int               `json:"status"`
-	Filename string            `json:"filename"`
-	Metadata resource.Metadata `json:"metadata"`
-	Resource *resource.Record  `json:"resource,omitempty"`
-	Links    *resource.Links   `json:"links,omitempty"`
-	Decision *policy.Decision  `json:"decision,omitempty"`
-	Error    *uploadError      `json:"error,omitempty"`
+	Success     bool               `json:"success"`
+	Status      int                `json:"status"`
+	Filename    string             `json:"filename"`
+	Metadata    resource.Metadata  `json:"metadata"`
+	Resource    *resource.Record   `json:"resource,omitempty"`
+	Links       *resource.Links    `json:"links,omitempty"`
+	Decision    *policy.Decision   `json:"decision,omitempty"`
+	Compression *compressionResult `json:"compression,omitempty"`
+	Error       *uploadError       `json:"error,omitempty"`
+}
+
+type compressionResult struct {
+	Applied         bool    `json:"applied"`
+	OriginalBytes   int64   `json:"originalBytes"`
+	CompressedBytes int64   `json:"compressedBytes"`
+	Quality         int     `json:"quality"`
+	Ratio           float64 `json:"ratio"`
 }
 
 type userGroupRequest struct {
@@ -581,6 +595,8 @@ type userGroupRequest struct {
 	MaxFileSizeBytes           int64  `json:"maxFileSizeBytes"`
 	DailyUploadLimit           int    `json:"dailyUploadLimit"`
 	AllowHotlink               bool   `json:"allowHotlink"`
+	ImageCompressionEnabled    *bool  `json:"imageCompressionEnabled"`
+	ImageCompressionQuality    int    `json:"imageCompressionQuality"`
 }
 
 type accountUsageResponse struct {
@@ -890,6 +906,21 @@ func (api *API) updateUserGroup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "user group not found"})
 		return
 	}
+	imageCompressionEnabled := existing.ImageCompressionEnabled
+	if req.ImageCompressionEnabled != nil {
+		imageCompressionEnabled = *req.ImageCompressionEnabled
+	}
+	imageCompressionQuality := existing.ImageCompressionQuality
+	if req.ImageCompressionQuality > 0 {
+		imageCompressionQuality = req.ImageCompressionQuality
+	}
+	if imageCompressionQuality == 0 {
+		imageCompressionQuality = 50
+	}
+	if imageCompressionQuality < 50 || imageCompressionQuality > 80 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image compression quality must be between 50 and 80"})
+		return
+	}
 	group := persist.UserGroup{
 		ID:                         existing.ID,
 		Name:                       firstNonEmpty(strings.TrimSpace(req.Name), existing.Name),
@@ -899,6 +930,8 @@ func (api *API) updateUserGroup(w http.ResponseWriter, r *http.Request) {
 		MaxFileSizeBytes:           req.MaxFileSizeBytes,
 		DailyUploadLimit:           req.DailyUploadLimit,
 		AllowHotlink:               req.AllowHotlink,
+		ImageCompressionEnabled:    imageCompressionEnabled,
+		ImageCompressionQuality:    imageCompressionQuality,
 	}
 	updated, err := api.app.Data.UpdateUserGroup(r.Context(), group)
 	if err != nil {
@@ -1429,6 +1462,61 @@ func (api *API) statsOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"stats": stats})
 }
 
+type byteRange struct {
+	start int64
+	end   int64
+}
+
+func (br byteRange) length() int64 {
+	return br.end - br.start + 1
+}
+
+func parseByteRange(raw string, size int64) (byteRange, bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return byteRange{}, false, true
+	}
+	if !strings.HasPrefix(raw, "bytes=") {
+		return byteRange{}, true, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(raw, "bytes="))
+	if spec == "" || strings.Contains(spec, ",") {
+		return byteRange{}, true, false
+	}
+	dash := strings.Index(spec, "-")
+	if dash < 0 {
+		return byteRange{}, true, false
+	}
+	startRaw := strings.TrimSpace(spec[:dash])
+	endRaw := strings.TrimSpace(spec[dash+1:])
+	if startRaw == "" {
+		suffixLength, err := strconv.ParseInt(endRaw, 10, 64)
+		if err != nil || suffixLength <= 0 || size <= 0 {
+			return byteRange{}, true, false
+		}
+		if suffixLength >= size {
+			return byteRange{start: 0, end: size - 1}, true, true
+		}
+		return byteRange{start: size - suffixLength, end: size - 1}, true, true
+	}
+
+	start, err := strconv.ParseInt(startRaw, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return byteRange{}, true, false
+	}
+	end := size - 1
+	if endRaw != "" {
+		end, err = strconv.ParseInt(endRaw, 10, 64)
+		if err != nil || end < start {
+			return byteRange{}, true, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return byteRange{start: start, end: end}, true, true
+}
+
 func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 	record, err := api.app.Data.Resource(r.Context(), r.PathValue("id"))
 	if errors.Is(err, persist.ErrNotFound) || record.Status == resource.StatusDeleted {
@@ -1478,13 +1566,30 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	requestedRange, hasRange, rangeOK := parseByteRange(r.Header.Get("Range"), record.Size)
+	if !rangeOK {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", record.Size))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	plannedBytes := record.Size
+	countAccess := true
+	if hasRange {
+		plannedBytes = requestedRange.length()
+		countAccess = requestedRange.start == 0
+	}
+	if r.Method == http.MethodHead {
+		plannedBytes = 0
+		countAccess = false
+	}
+
 	month := time.Now().Format("2006-01")
 	currentMonthlyTraffic := record.MonthlyTraffic
 	if record.MonthWindow != month {
 		currentMonthlyTraffic = 0
 	}
 	limit := decision.Rule.MonthlyTrafficPerResourceBytes
-	if limit > 0 && currentMonthlyTraffic+record.Size > limit {
+	if limit > 0 && plannedBytes > 0 && currentMonthlyTraffic+plannedBytes > limit {
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
 			"error": api.limitErrorPayload("resource_monthly_traffic_exceeded", "resource monthly traffic limit exceeded", "resource_month", limit, currentMonthlyTraffic, record.ID),
 		})
@@ -1513,19 +1618,49 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 	if shouldForceAttachment(record, decision.Rule.DownloadDisposition) {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(record.OriginalName)))
 	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", record.Size))
-	w.WriteHeader(http.StatusOK)
-	written, copyErr := io.Copy(w, file)
+	w.Header().Set("Accept-Ranges", "bytes")
+	status := http.StatusOK
+	contentLength := record.Size
+	if hasRange {
+		status = http.StatusPartialContent
+		contentLength = requestedRange.length()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", requestedRange.start, requestedRange.end, record.Size))
+		if requestedRange.start > 0 {
+			if seeker, ok := file.(io.Seeker); ok {
+				if _, err := seeker.Seek(requestedRange.start, io.SeekStart); err != nil {
+					writeJSON(w, http.StatusInternalServerError, errorPayload("failed to seek resource", err))
+					return
+				}
+			} else if _, err := io.CopyN(io.Discard, file, requestedRange.start); err != nil {
+				writeJSON(w, http.StatusInternalServerError, errorPayload("failed to seek resource", err))
+				return
+			}
+		}
+	}
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", contentLength))
+	w.WriteHeader(status)
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	var written int64
+	var copyErr error
+	if hasRange {
+		written, copyErr = io.CopyN(w, file, contentLength)
+	} else {
+		written, copyErr = io.Copy(w, file)
+	}
 	if copyErr == nil {
 		userID := ""
 		if hasViewer {
 			userID = viewer.ID
 		}
 		_, _ = api.app.Data.AddResourceTraffic(r.Context(), persist.AddTrafficParams{
-			ResourceID: record.ID,
-			UserID:     userID,
-			Bytes:      written,
-			AccessedAt: time.Now(),
+			ResourceID:      record.ID,
+			UserID:          userID,
+			Bytes:           written,
+			SkipAccessCount: !countAccess,
+			AccessedAt:      time.Now(),
 		})
 	}
 }
@@ -1586,14 +1721,13 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
-	hasher := sha256.New()
 	limit := decision.Rule.MaxFileSizeBytes
 	reader := io.Reader(file)
 	if limit > 0 {
 		reader = &io.LimitedReader{R: file, N: limit + 1}
 	}
 
-	written, err := io.Copy(io.MultiWriter(tempFile, hasher), reader)
+	written, err := io.Copy(tempFile, reader)
 	if err != nil {
 		item.Status = http.StatusInternalServerError
 		item.Error = &uploadError{Code: "buffer_failed", Message: "failed to buffer uploaded file"}
@@ -1610,8 +1744,6 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 		return item
 	}
 
-	now := time.Now()
-	hash := hex.EncodeToString(hasher.Sum(nil))
 	meta.Size = written
 	item.Metadata = meta
 
@@ -1636,12 +1768,29 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 		item.Error = &uploadError{Code: "group_not_found", Message: "user group not found"}
 		return item
 	}
+	if meta.Type == resource.TypeImage && imageDecoded && groupConfig.ImageCompressionEnabled {
+		result, err := api.compressUploadedImage(ctx, tempFile, meta, groupConfig.ImageCompressionQuality)
+		if err != nil {
+			_, _ = tempFile.Seek(0, io.SeekStart)
+		} else if result != nil {
+			item.Compression = result
+			meta.Size = result.CompressedBytes
+			item.Metadata = meta
+		}
+	}
 	if status, quotaErr := api.checkUploadQuota(ctx, actor, groupConfig, meta.Size); quotaErr != nil {
 		item.Status = status
 		item.Error = quotaErr
 		return item
 	}
 
+	hash, finalSniff, finalSniffLen, err := hashAndSniffTempFile(tempFile)
+	if err != nil {
+		item.Status = http.StatusInternalServerError
+		item.Error = &uploadError{Code: "hash_failed", Message: "failed to hash uploaded file"}
+		return item
+	}
+	now := time.Now()
 	objectKey := buildObjectKey(now, hash, meta.Extension)
 	defaultStorageID, activeStore, activeConfig, err := api.resolveDefaultStore(ctx)
 	if err != nil {
@@ -1687,7 +1836,7 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 		UploadIP:        uploadIP,
 		UploadUserAgent: userAgent,
 	}
-	headerDigest := sha256.Sum256(sniff[:n])
+	headerDigest := sha256.Sum256(finalSniff[:finalSniffLen])
 	metadata := resource.StoredMetadata{
 		ResourceID:   id,
 		HeaderSHA256: hex.EncodeToString(headerDigest[:]),
@@ -1737,6 +1886,131 @@ func decodeTempImage(file *os.File) (int, int, bool) {
 	return cfg.Width, cfg.Height, true
 }
 
+func (api *API) compressUploadedImage(ctx context.Context, file *os.File, meta resource.Metadata, quality int) (*compressionResult, error) {
+	quality = clampImageQuality(quality)
+	if !isCompressibleImage(meta) {
+		return nil, nil
+	}
+	select {
+	case api.compressionLimiter <- struct{}{}:
+		defer func() { <-api.compressionLimiter }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return nil, err
+	}
+	originalStat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	originalSize := originalStat.Size()
+
+	compressed, err := os.CreateTemp(api.app.Config.TempDir, "compress-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(compressed.Name())
+	defer compressed.Close()
+
+	switch {
+	case isJPEG(meta):
+		err = jpeg.Encode(compressed, img, &jpeg.Options{Quality: quality})
+	case isPNG(meta):
+		encoder := png.Encoder{CompressionLevel: png.BestCompression}
+		err = encoder.Encode(compressed, img)
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	compressedStat, err := compressed.Stat()
+	if err != nil {
+		return nil, err
+	}
+	compressedSize := compressedStat.Size()
+	if compressedSize <= 0 || compressedSize >= originalSize {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if _, err := compressed.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if err := file.Truncate(0); err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(file, compressed); err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return &compressionResult{
+		Applied:         true,
+		OriginalBytes:   originalSize,
+		CompressedBytes: compressedSize,
+		Quality:         quality,
+		Ratio:           1 - float64(compressedSize)/float64(originalSize),
+	}, nil
+}
+
+func hashAndSniffTempFile(file *os.File) (string, []byte, int, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", nil, 0, err
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", nil, 0, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", nil, 0, err
+	}
+	sniff := make([]byte, 512)
+	n, err := file.Read(sniff)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", nil, 0, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", nil, 0, err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), sniff, n, nil
+}
+
+func isCompressibleImage(meta resource.Metadata) bool {
+	return isJPEG(meta) || isPNG(meta)
+}
+
+func isJPEG(meta resource.Metadata) bool {
+	ext := strings.ToLower(strings.TrimPrefix(meta.Extension, "."))
+	return ext == "jpg" || ext == "jpeg" || strings.Contains(strings.ToLower(meta.ContentType), "jpeg")
+}
+
+func isPNG(meta resource.Metadata) bool {
+	ext := strings.ToLower(strings.TrimPrefix(meta.Extension, "."))
+	return ext == "png" || strings.Contains(strings.ToLower(meta.ContentType), "png")
+}
+
+func clampImageQuality(value int) int {
+	if value < 50 {
+		return 50
+	}
+	if value > 80 {
+		return 80
+	}
+	return value
+}
+
 func shouldValidateImage(extension, contentType string) bool {
 	switch strings.ToLower(strings.TrimPrefix(extension, ".")) {
 	case "jpg", "jpeg", "png", "gif":
@@ -1769,11 +2043,22 @@ func uploadWorkerCount(fileCount int) int {
 	if workers < 2 {
 		workers = 2
 	}
-	if workers > 4 {
-		workers = 4
+	if workers > 8 {
+		workers = 8
 	}
 	if workers > fileCount {
 		workers = fileCount
+	}
+	return workers
+}
+
+func compressionWorkerLimit() int {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		return 1
+	}
+	if workers > 8 {
+		return 8
 	}
 	return workers
 }

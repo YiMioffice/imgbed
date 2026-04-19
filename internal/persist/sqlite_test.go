@@ -104,3 +104,92 @@ func TestSQLiteStorePolicyGroupsCopyAndActivate(t *testing.T) {
 		t.Fatalf("active policy group = %q, want %q", active.ID, copied.ID)
 	}
 }
+
+func TestSQLiteStoreAddsMissingDefaultVideoRules(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "machring.db")
+	ctx := context.Background()
+
+	store, err := NewSQLite(dbPath, policy.DefaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM policy_rules WHERE policy_group_id = ? AND resource_type = ?`, policy.DefaultGroupID, string(resource.TypeVideo)); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	reopened, err := NewSQLite(dbPath, policy.DefaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	rules, err := reopened.RulesForGroup(ctx, policy.DefaultGroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, rule := range rules {
+		if rule.UserGroup == policy.GroupGuest && rule.ResourceType == resource.TypeVideo && rule.AllowUpload && rule.AllowAccess {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing guest video default rule: %#v", rules)
+	}
+}
+
+func TestSQLiteStorePersistsUserGroupImageCompression(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "machring.db")
+	ctx := context.Background()
+
+	store, err := NewSQLite(dbPath, policy.DefaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, err := store.UserGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guest UserGroup
+	for _, group := range groups {
+		if group.ID == policy.GroupGuest {
+			guest = group
+			break
+		}
+	}
+	if guest.ID == "" {
+		t.Fatal("guest group not found")
+	}
+	if !guest.ImageCompressionEnabled || guest.ImageCompressionQuality != 50 {
+		t.Fatalf("default compression = %v/%d, want true/50", guest.ImageCompressionEnabled, guest.ImageCompressionQuality)
+	}
+
+	guest.ImageCompressionEnabled = false
+	guest.ImageCompressionQuality = 80
+	if _, err := store.UpdateUserGroup(ctx, guest); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	reopened, err := NewSQLite(dbPath, policy.DefaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	groups, err = reopened.UserGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range groups {
+		if group.ID == policy.GroupGuest {
+			if group.ImageCompressionEnabled || group.ImageCompressionQuality != 80 {
+				t.Fatalf("persisted compression = %v/%d, want false/80", group.ImageCompressionEnabled, group.ImageCompressionQuality)
+			}
+			return
+		}
+	}
+	t.Fatal("guest group not found after reopen")
+}

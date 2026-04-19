@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +39,28 @@ var tinyPNG = []byte{
 }
 
 var tinySVG = []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>`)
+
+func testJPEG(t *testing.T) []byte {
+	t.Helper()
+
+	img := image.NewRGBA(image.Rect(0, 0, 160, 160))
+	for y := 0; y < img.Bounds().Dy(); y++ {
+		for x := 0; x < img.Bounds().Dx(); x++ {
+			img.Set(x, y, color.RGBA{
+				R: uint8((x*7 + y*3) % 256),
+				G: uint8((x*5 + y*11) % 256),
+				B: uint8((x*13 + y*2) % 256),
+				A: 255,
+			})
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
 
 func TestPolicyTestEndpoint(t *testing.T) {
 	api := testAPI(t, true)
@@ -282,6 +307,206 @@ func TestUploadCreatesResourceAndServesDirectLink(t *testing.T) {
 	}
 }
 
+func TestJPEGUploadAppliesGroupCompression(t *testing.T) {
+	api := testAPI(t, true)
+	guestGroup := lookupGroup(t, api, policy.GroupGuest)
+	guestGroup.ImageCompressionEnabled = true
+	guestGroup.ImageCompressionQuality = 50
+	if _, err := api.app.Data.UpdateUserGroup(context.Background(), guestGroup); err != nil {
+		t.Fatal(err)
+	}
+
+	original := testJPEG(t)
+	rec := uploadTestFile(t, api, "photo.jpg", original, "", "image/jpeg")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var payload struct {
+		Items    []uploadItemResponse `json:"items"`
+		Resource resource.Record      `json:"resource"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Items) != 1 {
+		t.Fatalf("items len = %d, want 1", len(payload.Items))
+	}
+	compression := payload.Items[0].Compression
+	if compression == nil || !compression.Applied {
+		t.Fatalf("compression was not applied: %#v", payload.Items[0].Compression)
+	}
+	if compression.OriginalBytes != int64(len(original)) {
+		t.Fatalf("original bytes = %d, want %d", compression.OriginalBytes, len(original))
+	}
+	if compression.CompressedBytes >= int64(len(original)) {
+		t.Fatalf("compressed bytes = %d, want smaller than %d", compression.CompressedBytes, len(original))
+	}
+	if payload.Resource.Size != compression.CompressedBytes {
+		t.Fatalf("resource size = %d, want %d", payload.Resource.Size, compression.CompressedBytes)
+	}
+
+	fileReq := httptest.NewRequest(http.MethodGet, "/r/"+payload.Resource.ID, nil)
+	fileRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(fileRec, fileReq)
+	if fileRec.Code != http.StatusOK {
+		t.Fatalf("serve status = %d, want %d; body: %s", fileRec.Code, http.StatusOK, fileRec.Body.String())
+	}
+	if int64(fileRec.Body.Len()) != compression.CompressedBytes {
+		t.Fatalf("served bytes = %d, want %d", fileRec.Body.Len(), compression.CompressedBytes)
+	}
+}
+
+func TestDeletingResourceRemovesFeaturedResource(t *testing.T) {
+	api := testAPI(t, true)
+	resourceID := uploadTestPNG(t, api)
+
+	addReq := httptest.NewRequest(http.MethodPost, "/api/v1/featured-resources", bytes.NewBufferString(fmt.Sprintf(`{"resourceId":%q,"sortOrder":1}`, resourceID)))
+	addAdminCookie(t, api, addReq)
+	addReq.Header.Set("Content-Type", "application/json")
+	addRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(addRec, addReq)
+	if addRec.Code != http.StatusCreated {
+		t.Fatalf("add featured status = %d, want %d; body: %s", addRec.Code, http.StatusCreated, addRec.Body.String())
+	}
+
+	beforeReq := httptest.NewRequest(http.MethodGet, "/api/v1/featured-resources", nil)
+	beforeRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(beforeRec, beforeReq)
+	if beforeRec.Code != http.StatusOK {
+		t.Fatalf("featured before status = %d, want %d; body: %s", beforeRec.Code, http.StatusOK, beforeRec.Body.String())
+	}
+	var beforePayload struct {
+		Items []persist.FeaturedResource `json:"items"`
+	}
+	if err := json.NewDecoder(beforeRec.Body).Decode(&beforePayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(beforePayload.Items) != 1 {
+		t.Fatalf("featured before len = %d, want 1", len(beforePayload.Items))
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, deleteReq)
+	deleteRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d, want %d; body: %s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
+	}
+
+	afterReq := httptest.NewRequest(http.MethodGet, "/api/v1/featured-resources", nil)
+	afterRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(afterRec, afterReq)
+	if afterRec.Code != http.StatusOK {
+		t.Fatalf("featured after status = %d, want %d; body: %s", afterRec.Code, http.StatusOK, afterRec.Body.String())
+	}
+	var afterPayload struct {
+		Items []persist.FeaturedResource `json:"items"`
+	}
+	if err := json.NewDecoder(afterRec.Body).Decode(&afterPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(afterPayload.Items) != 0 {
+		t.Fatalf("featured after len = %d, want 0", len(afterPayload.Items))
+	}
+}
+
+func TestRangeRequestsCountBytesWithoutInflatingAccessCount(t *testing.T) {
+	api := testAPI(t, true)
+	resourceID := uploadTestPNG(t, api)
+	ranges := []struct {
+		header string
+		start  int
+		end    int
+	}{
+		{header: "bytes=0-9", start: 0, end: 9},
+		{header: "bytes=10-19", start: 10, end: 19},
+		{header: fmt.Sprintf("bytes=20-%d", len(tinyPNG)-1), start: 20, end: len(tinyPNG) - 1},
+	}
+
+	for _, item := range ranges {
+		req := httptest.NewRequest(http.MethodGet, "/r/"+resourceID, nil)
+		req.Header.Set("Range", item.header)
+		rec := httptest.NewRecorder()
+		api.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("%s status = %d, want %d; body: %s", item.header, rec.Code, http.StatusPartialContent, rec.Body.String())
+		}
+		expectedContentRange := fmt.Sprintf("bytes %d-%d/%d", item.start, item.end, len(tinyPNG))
+		if got := rec.Header().Get("Content-Range"); got != expectedContentRange {
+			t.Fatalf("content range = %q, want %q", got, expectedContentRange)
+		}
+		if !bytes.Equal(rec.Body.Bytes(), tinyPNG[item.start:item.end+1]) {
+			t.Fatalf("served range mismatch for %s", item.header)
+		}
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, detailReq)
+	detailRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d; body: %s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+	var payload struct {
+		Detail resource.Detail `json:"detail"`
+	}
+	if err := json.NewDecoder(detailRec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Detail.Record.TrafficBytes != int64(len(tinyPNG)) {
+		t.Fatalf("traffic bytes = %d, want %d", payload.Detail.Record.TrafficBytes, len(tinyPNG))
+	}
+	if payload.Detail.Record.AccessCount != 1 {
+		t.Fatalf("access count = %d, want 1", payload.Detail.Record.AccessCount)
+	}
+	for _, window := range payload.Detail.TrafficWindows {
+		if window.WindowType == "day" && window.UserID == "" {
+			if window.RequestCount != 1 {
+				t.Fatalf("day request count = %d, want 1", window.RequestCount)
+			}
+			if window.TrafficBytes != int64(len(tinyPNG)) {
+				t.Fatalf("day traffic bytes = %d, want %d", window.TrafficBytes, len(tinyPNG))
+			}
+			return
+		}
+	}
+	t.Fatalf("anonymous day traffic window not found: %#v", payload.Detail.TrafficWindows)
+}
+
+func TestUnsatisfiableRangeDoesNotCountTraffic(t *testing.T) {
+	api := testAPI(t, true)
+	resourceID := uploadTestPNG(t, api)
+
+	req := httptest.NewRequest(http.MethodGet, "/r/"+resourceID, nil)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-", len(tinyPNG)))
+	rec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusRequestedRangeNotSatisfiable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Range"); got != fmt.Sprintf("bytes */%d", len(tinyPNG)) {
+		t.Fatalf("content range = %q", got)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/resources/"+resourceID, nil)
+	addAdminCookie(t, api, detailReq)
+	detailRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, want %d; body: %s", detailRec.Code, http.StatusOK, detailRec.Body.String())
+	}
+	var payload struct {
+		Detail resource.Detail `json:"detail"`
+	}
+	if err := json.NewDecoder(detailRec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Detail.Record.TrafficBytes != 0 || payload.Detail.Record.AccessCount != 0 {
+		t.Fatalf("traffic/access = %d/%d, want 0/0", payload.Detail.Record.TrafficBytes, payload.Detail.Record.AccessCount)
+	}
+}
+
 func TestRawAssetRouteDoesNotBypassResourcePolicy(t *testing.T) {
 	api := testAPI(t, true)
 	resourceID := uploadTestPNG(t, api)
@@ -432,6 +657,25 @@ func TestUploadRejectsContentTypeMismatch(t *testing.T) {
 	}
 	if payload.Error.Code != "content_type_mismatch" {
 		t.Fatalf("error code = %q, want %q", payload.Error.Code, "content_type_mismatch")
+	}
+}
+
+func TestVideoUploadCreatesVideoResource(t *testing.T) {
+	api := testAPI(t, true)
+
+	rec := uploadTestFile(t, api, "clip.mp4", []byte("not a full mp4 but enough for policy coverage"), "", "video/mp4")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	var payload struct {
+		Resource resource.Record `json:"resource"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Resource.Type != resource.TypeVideo {
+		t.Fatalf("resource type = %q, want %q", payload.Resource.Type, resource.TypeVideo)
 	}
 }
 
@@ -638,6 +882,39 @@ func TestUserGroupQuotaRejectsAuthenticatedUpload(t *testing.T) {
 	}
 	if payload.Error.Code != "storage_quota_exceeded" {
 		t.Fatalf("error code = %q, want %q", payload.Error.Code, "storage_quota_exceeded")
+	}
+}
+
+func TestUpdateUserGroupPreservesCompressionWhenOmitted(t *testing.T) {
+	api := testAPI(t, true)
+	guestGroup := lookupGroup(t, api, policy.GroupGuest)
+	guestGroup.ImageCompressionEnabled = false
+	guestGroup.ImageCompressionQuality = 80
+	if _, err := api.app.Data.UpdateUserGroup(context.Background(), guestGroup); err != nil {
+		t.Fatal(err)
+	}
+
+	body := bytes.NewBufferString(`{
+		"name":"游客",
+		"description":"兼容旧客户端",
+		"totalCapacityBytes":0,
+		"defaultMonthlyTrafficBytes":0,
+		"maxFileSizeBytes":0,
+		"dailyUploadLimit":0,
+		"allowHotlink":true
+	}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/user-groups/"+policy.GroupGuest, body)
+	addAdminCookie(t, api, req)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	updated := lookupGroup(t, api, policy.GroupGuest)
+	if updated.ImageCompressionEnabled || updated.ImageCompressionQuality != 80 {
+		t.Fatalf("compression = %v/%d, want false/80", updated.ImageCompressionEnabled, updated.ImageCompressionQuality)
 	}
 }
 

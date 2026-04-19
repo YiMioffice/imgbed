@@ -12,6 +12,7 @@
   let isUserPage = false;
   let isStoragePage = false;
   let isSiteSettingsPage = false;
+  let isCompressionPage = false;
   let isFeaturedAdminPage = false;
   let isExplorePage = false;
   let isAdminPage = false;
@@ -28,10 +29,10 @@
   type ResourceLinks = { direct: string; markdown: string; html: string; bbcode: string };
   type ResourceDetail = { record: ResourceRecord; metadata: { resourceId: string; headerSha256: string; imageWidth: number; imageHeight: number; imageDecoded: boolean }; variants: Array<{ id: string; kind: string; objectKey: string; contentType: string; size: number; width: number; height: number }>; links: ResourceLinks; trafficWindows: Array<{ windowType: string; windowKey: string; requestCount: number; trafficBytes: number }> };
   type SignedLinkResult = { url: string; expiresAt: string };
-  type UploadItemResponse = { success: boolean; status: number; filename: string; metadata: { filename: string; extension: string; type: string; contentType: string; size: number }; resource?: ResourceRecord; links?: ResourceLinks; decision?: PolicyDecision; error?: { code: string; message: string } };
+  type UploadItemResponse = { success: boolean; status: number; filename: string; metadata: { filename: string; extension: string; type: string; contentType: string; size: number }; resource?: ResourceRecord; links?: ResourceLinks; decision?: PolicyDecision; compression?: { applied: boolean; originalBytes: number; compressedBytes: number; quality: number; ratio: number }; error?: { code: string; message: string } };
   type UploadQueueItem = { name: string; size: number; progress: number; status: 'pending' | 'uploading' | 'success' | 'error'; resource?: ResourceRecord; links?: ResourceLinks; message?: string; errorCode?: string };
   type OverviewStats = { totalResources: number; activeResources: number; totalStorageBytes: number; totalTrafficBytes: number; todayUploads: number; recentTraffic: Array<{ label: string; bytes: number }> };
-  type UserGroup = { id: string; name: string; description: string; totalCapacityBytes: number; defaultMonthlyTrafficBytes: number; maxFileSizeBytes: number; dailyUploadLimit: number; allowHotlink: boolean; createdAt: string; updatedAt: string };
+  type UserGroup = { id: string; name: string; description: string; totalCapacityBytes: number; defaultMonthlyTrafficBytes: number; maxFileSizeBytes: number; dailyUploadLimit: number; allowHotlink: boolean; imageCompressionEnabled: boolean; imageCompressionQuality: number; createdAt: string; updatedAt: string };
   type AccountUsage = { user?: AuthUser | null; group: UserGroup; usedStorageBytes: number; monthlyTrafficBytes: number; dailyUploadCount: number };
   type ManagedUser = AuthUser;
   type StorageConfig = { id: string; type: string; name: string; endpoint: string; region: string; bucket: string; accessKeyId: string; secretAccessKey?: string; username?: string; password?: string; publicBaseUrl: string; basePath: string; usePathStyle: boolean; isDefault: boolean; createdAt?: string; updatedAt?: string };
@@ -40,6 +41,7 @@
 
   const groupOptions = ['guest', 'user', 'admin'];
   const resourceTypeOptions = ['image', 'script', 'stylesheet', 'archive', 'executable', 'document', 'font', 'video', 'other'];
+  const resourcePageSizeOptions = [8, 12, 24];
   const megabyte = 1024 * 1024;
   const gigabyte = 1024 * 1024 * 1024;
   const groupLabels: Record<string, string> = { guest: '游客', user: '登录用户', admin: '管理员' };
@@ -65,9 +67,10 @@
     const user = pathname === '/admin/users';
     const storage = pathname === '/admin/storage';
     const siteSettings = pathname === '/admin/site';
+    const compression = pathname === '/admin/compression';
     const featuredAdmin = pathname === '/admin/featured';
     const explore = pathname === '/explore';
-    const admin = dashboard || policy || resource || userGroup || user || storage || siteSettings || featuredAdmin;
+    const admin = dashboard || policy || resource || userGroup || user || storage || siteSettings || compression || featuredAdmin;
     return {
       parts: segments,
       resourceDetailId: detailId,
@@ -79,6 +82,7 @@
       isUserPage: user,
       isStoragePage: storage,
       isSiteSettingsPage: siteSettings,
+      isCompressionPage: compression,
       isFeaturedAdminPage: featuredAdmin,
       isExplorePage: explore,
       isAdminPage: admin,
@@ -103,11 +107,11 @@
   let featuredResources: FeaturedResource[] = [];
   let featuredReady = false;
 
-  let installForm = { siteName: '马赫环', defaultStorage: 'local', adminUsername: 'admin', displayName: '管理员', password: '', confirmPassword: '' };
+  let installForm = { siteName: '马赫环', defaultStorage: 'local', adminUsername: 'owner', displayName: '管理员', password: '', confirmPassword: '' };
   let installError = '';
   let isInitializing = false;
 
-  let loginForm = { username: 'admin', password: '' };
+  let loginForm = { username: '', password: '' };
   let loginError = '';
   let isLoggingIn = false;
 
@@ -116,6 +120,7 @@
   let uploadQueue: UploadQueueItem[] = [];
   let uploadError = '';
   let uploadProgress = 0;
+  let uploadSpeedBps = 0;
   let isUploading = false;
   let isDragging = false;
 
@@ -140,10 +145,11 @@
   let resourceFilters = { search: '', type: '', status: 'active', userGroup: '', sort: 'created_desc' };
   let resources: ResourceRecord[] = [];
   let resourcePage = 1;
-  let resourcePageSize = 12;
+  let resourcePageSize = resourcePageSizeOptions[0];
   let resourceTotal = 0;
   let resourceTotalPages = 0;
   let resourceError = '';
+  let resourceMessage = '';
   let isLoadingResources = false;
 
   let resourceDetail: ResourceDetail | null = null;
@@ -157,6 +163,7 @@
   let userGroups: UserGroup[] = [];
   let userGroupError = '';
   let userGroupMessage = '';
+  let savingUserGroupId = '';
   let managedUsers: ManagedUser[] = [];
   let userAdminError = '';
   let userAdminMessage = '';
@@ -164,12 +171,14 @@
   let storageConfigs: StorageConfig[] = [];
   let storageError = '';
   let storageMessage = '';
+  let savingStorageId = '';
   let storageHealthResult = '';
   let siteSettingsError = '';
   let siteSettingsMessage = '';
   let featuredError = '';
   let featuredMessage = '';
   let routeLoadToken = 0;
+  let routeTransitionTimer = 0;
   const inflightLoads = new Map<string, Promise<void>>();
   const cacheTTL = {
     install: 60_000,
@@ -203,13 +212,14 @@
   const policyCacheTimestamps = new Map<string, number>();
   const resourceDetailCacheTimestamps = new Map<string, number>();
 
-  $: ({ parts, resourceDetailId, isDashboardPage, isPolicyPage, isResourcePage, isResourceDetailPage, isUserGroupPage, isUserPage, isStoragePage, isSiteSettingsPage, isFeaturedAdminPage, isExplorePage, isAdminPage, isAdminProtectedPage, isAccountPage } = resolveRouteState(path));
+  $: ({ parts, resourceDetailId, isDashboardPage, isPolicyPage, isResourcePage, isResourceDetailPage, isUserGroupPage, isUserPage, isStoragePage, isSiteSettingsPage, isCompressionPage, isFeaturedAdminPage, isExplorePage, isAdminPage, isAdminProtectedPage, isAccountPage } = resolveRouteState(path));
 
   $: uploadGroup = currentUser?.groupId ?? 'guest';
 
   onMount(() => {
     const handlePopState = () => {
       path = window.location.pathname;
+      pulseRouteTransition();
       void handleRouteChange();
     };
     window.addEventListener('popstate', handlePopState);
@@ -219,15 +229,31 @@
       bootstrapReady = true;
       await handleRouteChange();
     })();
-    return () => window.removeEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      if (routeTransitionTimer) window.clearTimeout(routeTransitionTimer);
+      document.documentElement.classList.remove('route-transitioning');
+    };
   });
 
   async function navigate(url: string, replace = false) {
     if (url === path) return;
     window.history[replace ? 'replaceState' : 'pushState']({}, '', url);
     path = window.location.pathname;
+    pulseRouteTransition();
     window.scrollTo({ top: 0, behavior: 'auto' });
     await handleRouteChange();
+  }
+
+  function pulseRouteTransition() {
+    document.documentElement.classList.remove('route-transitioning');
+    void document.documentElement.offsetWidth;
+    document.documentElement.classList.add('route-transitioning');
+    if (routeTransitionTimer) window.clearTimeout(routeTransitionTimer);
+    routeTransitionTimer = window.setTimeout(() => {
+      document.documentElement.classList.remove('route-transitioning');
+      routeTransitionTimer = 0;
+    }, 260);
   }
 
   function jump(url: string) { void navigate(url); }
@@ -286,6 +312,7 @@
       if (route.isUserPage) tasks.push(loadUserAdminData());
       if (route.isStoragePage) tasks.push(loadStorageConfigs());
       if (route.isSiteSettingsPage) tasks.push(loadSiteSettings());
+      if (route.isCompressionPage) tasks.push(loadUserGroups());
       if (route.isFeaturedAdminPage) tasks.push(loadResources(resourcePage, false, true));
       if (route.isResourcePage) tasks.push(loadResources(resourcePage, false, false));
       if (route.isResourceDetailPage) tasks.push(loadResourceDetail(route.resourceDetailId));
@@ -491,17 +518,19 @@
     if (uploadFiles.length === 0) return void (uploadError = '请选择至少一个资源文件。');
     isUploading = true;
     uploadProgress = 0;
+    uploadSpeedBps = 0;
     uploadQueue = uploadFiles.map((file) => ({ name: file.name, size: file.size, progress: 0, status: 'uploading' }));
     try {
-      const payload = await uploadWithProgress(uploadFiles, (ratio) => {
+      const payload = await uploadWithProgress(uploadFiles, (ratio, speedBps) => {
         uploadProgress = ratio;
+        uploadSpeedBps = speedBps;
         uploadQueue = uploadQueue.map((item, index) => ({ ...item, progress: estimateItemProgress(uploadFiles, index, ratio) }));
       });
       const items = (payload.items ?? []) as UploadItemResponse[];
       uploadQueue = uploadQueue.map((item, index) => {
         const result = items[index];
         if (!result) return { ...item, status: 'error', progress: 0, message: '上传结果缺失' };
-        return { ...item, progress: result.success ? 1 : 0, status: result.success ? 'success' : 'error', resource: result.resource, links: result.links, message: result.success ? translateSystemMessage(result.decision?.reason || '上传完成') : translateSystemMessage(result.error?.message || result.decision?.reason || '上传失败'), errorCode: result.error?.code };
+        return { ...item, progress: result.success ? 1 : 0, status: result.success ? 'success' : 'error', resource: result.resource, links: result.links, message: result.success ? uploadSuccessMessage(result) : translateSystemMessage(result.error?.message || result.decision?.reason || '上传失败'), errorCode: result.error?.code };
       });
       uploadProgress = 1;
       invalidateCache('homeStats', 'accountUsage', 'resources', 'featuredResources');
@@ -516,12 +545,18 @@
     }
   }
 
-  function uploadWithProgress(files: File[], onProgress: (ratio: number) => void) {
+  function uploadWithProgress(files: File[], onProgress: (ratio: number, speedBps: number) => void) {
     return new Promise<any>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      const startedAt = performance.now();
       xhr.open('POST', '/api/v1/resources/upload');
       xhr.responseType = 'text';
-      xhr.upload.onprogress = (event) => { if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total); };
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && event.total > 0) {
+          const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.1);
+          onProgress(event.loaded / event.total, event.loaded / elapsedSeconds);
+        }
+      };
       xhr.onload = () => {
         try {
           const payload = xhr.responseText ? JSON.parse(xhr.responseText) : {};
@@ -550,6 +585,15 @@
     return ratio;
   }
 
+  function uploadSuccessMessage(result: UploadItemResponse) {
+    if (result.compression?.applied) {
+      return `上传完成，已压缩 ${formatBytes(result.compression.originalBytes)} → ${formatBytes(result.compression.compressedBytes)}。`;
+    }
+    return translateSystemMessage(result.decision?.reason || '上传完成');
+  }
+
+  function formatUploadSpeed(value: number) { return value > 0 ? `${formatBytes(value)}/s` : '计算中'; }
+
   async function loadPolicyGroups(force = false) { if (!force && isFresh(cacheTimestamps.policyGroups, cacheTTL.policyGroups)) return; policyGroupError = ''; return runDeduped('policyGroups', async () => { try { const res = await fetch('/api/v1/policy-groups'); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '加载策略组失败'); policyGroups = payload.groups ?? []; activePolicyGroupId = payload.activeGroup?.id ?? ''; if (!selectedPolicyGroupId || !policyGroups.some((group) => group.id === selectedPolicyGroupId)) selectedPolicyGroupId = activePolicyGroupId || policyGroups[0]?.id || ''; cacheTimestamps.policyGroups = Date.now(); } catch (error) { policyGroupError = error instanceof Error ? error.message : '加载策略组失败'; } }); }
   async function loadPolicies(groupId = selectedPolicyGroupId, force = false) { const resolved = groupId || activePolicyGroupId; if (!resolved) return; if (!force && policyCacheTimestamps.has(resolved) && isFresh(policyCacheTimestamps.get(resolved) ?? 0, cacheTTL.policies)) return; policySaveError = ''; policySaveMessage = ''; return runDeduped(`policies:${resolved}`, async () => { try { const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(resolved)}`); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.error ?? '加载策略失败'); selectedPolicyGroupId = payload.group?.id ?? resolved; rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.set(resolved, Date.now()); } catch (error) { policySaveError = error instanceof Error ? error.message : '加载策略失败'; } }); }
   async function loadPolicyEditor(groupId = selectedPolicyGroupId) {
@@ -570,7 +614,7 @@
   async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.delete(selectedPolicyGroupId); cacheTimestamps.policyGroups = 0; policySaveMessage = '策略已保存。'; await loadPolicyGroups(true); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
   async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: unitToBytes(String(policyForm.size), megabyte) }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
   async function loadUserGroups(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.userGroups, cacheTTL.userGroups)) return; if (!silent) { userGroupError = ''; userGroupMessage = ''; } return runDeduped('userGroups', async () => { try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; cacheTimestamps.userGroups = Date.now(); } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }); }
-  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } }
+  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; savingUserGroupId = group.id; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink, imageCompressionEnabled: !!group.imageCompressionEnabled, imageCompressionQuality: clampCompressionQuality(group.imageCompressionQuality) }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } finally { savingUserGroupId = ''; } }
   async function loadUsers(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.users, cacheTTL.users)) return; if (!silent) { userAdminError = ''; userAdminMessage = ''; } return runDeduped('users', async () => { try { const res = await fetch('/api/v1/users'); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '加载用户失败'); managedUsers = payload.users ?? []; cacheTimestamps.users = Date.now(); } catch (error) { if (!silent) userAdminError = error instanceof Error ? error.message : '加载用户失败'; } }); }
   async function loadUserAdminData() { await loadUserGroups(true); await loadUsers(); }
   async function loadStorageConfigs(force = false) {
@@ -599,6 +643,7 @@
   async function saveStorageConfig(config: StorageConfig) {
     storageError = '';
     storageMessage = '';
+    savingStorageId = config.id;
     try {
       const res = await fetch(`/api/v1/storage-configs/${encodeURIComponent(config.id)}`, {
         method: 'PUT',
@@ -626,6 +671,8 @@
       await loadStorageConfigs(true);
     } catch (error) {
       storageError = error instanceof Error ? error.message : '保存存储配置失败';
+    } finally {
+      savingStorageId = '';
     }
   }
   async function runStorageHealthCheck(config: StorageConfig) {
@@ -695,9 +742,26 @@
   }
 
   async function loadResourceDetail(id: string, force = false) { if (!id) return; if (!force && resourceDetail?.record.id === id && isFresh(resourceDetailCacheTimestamps.get(id) ?? 0, cacheTTL.resourceDetail)) return; isLoadingDetail = true; detailError = ''; signedLinkResult = null; return runDeduped(`resourceDetail:${id}`, async () => { try { const res = await fetch(`/api/v1/resources/${encodeURIComponent(id)}`); const payload = await res.json(); if (!res.ok) return void (detailError = payload.error ?? '加载资源详情失败'); resourceDetail = payload.detail; resourceDetailCacheTimestamps.set(id, Date.now()); } catch (error) { detailError = error instanceof Error ? error.message : '加载资源详情失败'; } finally { isLoadingDetail = false; } }); }
-  async function mutateResource(url: string, method: string) { resourceError = ''; const res = await fetch(url, { method }); const payload = await res.json(); if (!res.ok) return void (resourceError = payload.error ?? '资源操作失败'); invalidateCache('resources', 'homeStats', 'featuredResources'); if (payload.resource?.id) resourceDetailCacheTimestamps.delete(payload.resource.id); await loadResources(resourcePage, true); if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id, true); await loadHomeStats(true); }
-  const deleteResource = (id: string) => mutateResource(`/api/v1/resources/${id}`, 'DELETE');
-  const restoreResource = (id: string) => mutateResource(`/api/v1/resources/${id}/restore`, 'POST');
+  async function mutateResource(url: string, method: string, successMessage: string) {
+    resourceError = '';
+    resourceMessage = '';
+    const res = await fetch(url, { method });
+    const payload = await res.json();
+    if (!res.ok) return void (resourceError = payload.error ?? '资源操作失败');
+    invalidateCache('resources', 'homeStats', 'featuredResources');
+    if (payload.resource?.id) resourceDetailCacheTimestamps.delete(payload.resource.id);
+    await loadResources(resourcePage, true);
+    if (resourceDetail?.record.id === payload.resource?.id) await loadResourceDetail(resourceDetail.record.id, true);
+    await Promise.all([loadHomeStats(true), loadFeaturedResources(true)]);
+    resourceMessage = successMessage;
+  }
+  async function deleteResource(id: string) {
+    const item = resources.find((resourceItem) => resourceItem.id === id);
+    const label = item?.originalName ?? id;
+    if (!window.confirm(`确认删除「${label}」？删除后会从精选中移除，可在已删除列表恢复。`)) return;
+    await mutateResource(`/api/v1/resources/${encodeURIComponent(id)}`, 'DELETE', '资源已删除，并已从精选列表移除。');
+  }
+  const restoreResource = (id: string) => mutateResource(`/api/v1/resources/${encodeURIComponent(id)}/restore`, 'POST', '资源已恢复。');
   async function updateResourceVisibility(id: string, isPrivate: boolean) {
     detailError = '';
     signedLinkResult = null;
@@ -728,6 +792,15 @@
   }
   async function applyResourceFilters() { resourcePage = 1; await loadResources(1); }
   async function changeResourcePage(page: number) { if (page < 1 || page > resourceTotalPages) return; resourcePage = page; await loadResources(page); }
+  async function changeResourcePageSize(value: string) {
+    const nextSize = Number(value);
+    if (!resourcePageSizeOptions.includes(nextSize) || nextSize === resourcePageSize) return;
+    resourcePageSize = nextSize;
+    resourcePage = 1;
+    resourcesCacheKey = '';
+    invalidateCache('resources');
+    await loadResources(1, true, isFeaturedAdminPage);
+  }
   async function addFeatured(record: ResourceRecord) {
     featuredError = '';
     featuredMessage = '';
@@ -811,6 +884,12 @@
     done(window.isSecureContext ? '复制失败，请手动复制。' : '当前为 HTTP 环境，系统剪贴板受限，请手动复制。');
   }
   function formatBytes(value: number) { if (!value) return '0 B'; const units = ['B', 'KB', 'MB', 'GB', 'TB']; let size = value; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; } return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`; }
+  function recentTrafficTotal() { return homeStats.recentTraffic.reduce((sum, point) => sum + point.bytes, 0); }
+  function trafficPercent(bytes: number) {
+    const maxBytes = Math.max(0, ...homeStats.recentTraffic.map((point) => point.bytes));
+    if (maxBytes <= 0 || bytes <= 0) return 0;
+    return Math.max(4, Math.round((bytes / maxBytes) * 100));
+  }
   async function readJSON(res: Response) { try { return await res.json(); } catch { return { error: res.ok ? '' : `请求失败：HTTP ${res.status}` }; } }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
@@ -830,6 +909,8 @@
   }
   function bytesToUnit(value: number, unit: number) { if (!value) return '0'; const converted = value / unit; return Number.isInteger(converted) ? String(converted) : converted.toFixed(2).replace(/\.?0+$/, ''); }
   function unitToBytes(raw: string, unit: number) { const normalized = Number(raw); if (!Number.isFinite(normalized) || normalized <= 0) return 0; return Math.round(normalized * unit); }
+  function clampCompressionQuality(value: number) { const next = Number(value) || 50; return Math.max(50, Math.min(80, Math.round(next))); }
+  function compressionHint(group?: UserGroup | null) { if (!group?.imageCompressionEnabled) return '图片压缩关闭'; return `图片压缩质量 ${clampCompressionQuality(group.imageCompressionQuality)}%`; }
   function updateRuleMaxFileSize(rule: PolicyRule, value: string) { rule.maxFileSizeBytes = unitToBytes(value, megabyte); matrixBaseRules = [...matrixBaseRules]; }
   function updateRuleMonthlyTraffic(rule: PolicyRule, value: string) { rule.monthlyTrafficPerResourceBytes = unitToBytes(value, gigabyte); matrixBaseRules = [...matrixBaseRules]; }
   function updateOverrideMaxFileSize(index: number, value: string) { matrixOverrideRules[index].maxFileSizeBytes = unitToBytes(value, megabyte); matrixOverrideRules = [...matrixOverrideRules]; }
@@ -917,7 +998,7 @@
             <article class="summary-card">
               <span>可用策略提示</span>
               <strong>{quotaHint(accountUsage?.group)}</strong>
-              <small>{accountUsage ? `已用 ${formatBytes(accountUsage.usedStorageBytes)} · 今日 ${accountUsage.dailyUploadCount} 次` : '加载中'}</small>
+              <small>{accountUsage ? `已用 ${formatBytes(accountUsage.usedStorageBytes)} · 今日 ${accountUsage.dailyUploadCount} 次 · ${compressionHint(accountUsage.group)}` : '加载中'}</small>
             </article>
           </div>
           {#if accountError}<p class="form-error">{accountError}</p>{/if}
@@ -950,7 +1031,7 @@
           {/if}
           {#if uploadError}<p class="form-error">{uploadError}</p>{/if}
           {#if copyMessage}<p class="form-success">{copyMessage}</p>{/if}
-          {#if isUploading}<div class="overall-progress"><div class="progress-track"><span style={`width: ${Math.round(uploadProgress * 100)}%`}></span></div><span>{Math.round(uploadProgress * 100)}%</span></div>{/if}
+          {#if isUploading}<div class="overall-progress"><div class="progress-track"><span style={`width: ${Math.round(uploadProgress * 100)}%`}></span></div><span>{Math.round(uploadProgress * 100)}% · {formatUploadSpeed(uploadSpeedBps)}</span></div>{/if}
           <button class="button primary" type="submit" disabled={isUploading || uploadFiles.length === 0 || (!currentUser && !siteSettings.allowGuestUploads)}>{isUploading ? '上传中' : '开始上传'}</button>
         </form>
       {/if}
@@ -1152,6 +1233,7 @@
         <a class:active={isUserPage} class="admin-nav-link" href="/admin/users" on:click|preventDefault={() => navigate('/admin/users')}>用户管理</a>
         <a class:active={isStoragePage} class="admin-nav-link" href="/admin/storage" on:click|preventDefault={() => navigate('/admin/storage')}>存储设置</a>
         <a class:active={isSiteSettingsPage} class="admin-nav-link" href="/admin/site" on:click|preventDefault={() => navigate('/admin/site')}>站点设置</a>
+        <a class:active={isCompressionPage} class="admin-nav-link" href="/admin/compression" on:click|preventDefault={() => navigate('/admin/compression')}>图片压缩</a>
         <a class:active={isFeaturedAdminPage} class="admin-nav-link" href="/admin/featured" on:click|preventDefault={() => navigate('/admin/featured')}>精选管理</a>
         <a class:active={isResourcePage || isResourceDetailPage} class="admin-nav-link" href="/admin/resources" on:click|preventDefault={() => navigate('/admin/resources')}>资源管理</a>
       </nav>
@@ -1169,13 +1251,25 @@
           <article><span>今日上传</span><strong>{homeStats.todayUploads}</strong></article>
           <article><span>用户总数</span><strong>{managedUsers.length}</strong></article>
           <article><span>用户组数量</span><strong>{userGroups.length}</strong></article>
-          <article><span>近七日流量</span><strong>{formatBytes(homeStats.recentTraffic.reduce((sum, point) => sum + point.bytes, 0))}</strong></article>
+          <article><span>近七日流量</span><strong>{formatBytes(recentTrafficTotal())}</strong></article>
         </div>
-        <div class="window-list">
-          {#each homeStats.recentTraffic as point}
-            <article class="window-card"><strong>{point.label}</strong><span>{formatBytes(point.bytes)}</span></article>
-          {/each}
-        </div>
+        <section class="traffic-table-panel">
+          <div class="subsection-heading"><h3>近七日流量明细</h3><p>按日期汇总真实传输字节，分片下载只累计实际传出的范围字节。</p></div>
+          <div class="traffic-table-wrap">
+            <table class="traffic-table">
+              <thead><tr><th>日期</th><th>流量</th><th>占比</th></tr></thead>
+              <tbody>
+                {#each homeStats.recentTraffic as point}
+                  <tr>
+                    <td>{point.label}</td>
+                    <td>{formatBytes(point.bytes)}</td>
+                    <td><div class="traffic-bar" aria-label={`流量占比 ${trafficPercent(point.bytes)}%`}><span style={`width: ${trafficPercent(point.bytes)}%`}></span></div></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        </section>
       {:else if isPolicyPage}
         <div class="section-heading"><p class="eyebrow">策略组管理</p><h2>策略组</h2><p>复制、启用、停用不同策略组，并对选中策略组直接编辑规则。</p></div>
         <div class="admin-session"><span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span></div>
@@ -1227,7 +1321,7 @@
                 <label>每日上传次数<input bind:value={group.dailyUploadLimit} type="number" min="0" /></label>
               </div>
               <label class="toggle-row"><span>允许匿名外链</span><input bind:checked={group.allowHotlink} type="checkbox" /></label>
-              <div class="resource-actions"><button class="button primary compact" type="button" on:click={() => saveUserGroup(group)}>保存用户组</button></div>
+              <div class="resource-actions"><button class="button primary compact" type="button" on:click={() => saveUserGroup(group)} disabled={savingUserGroupId === group.id}>{savingUserGroupId === group.id ? '保存中' : '保存用户组'}</button></div>
             </article>
           {/each}
         </div>
@@ -1296,7 +1390,7 @@
               </div>
               <label class="toggle-row"><span>设为默认上传存储</span><input bind:checked={config.isDefault} type="checkbox" on:change={() => storageConfigs = storageConfigs.map((item) => ({ ...item, isDefault: item.id === config.id }))} /></label>
               <div class="resource-actions">
-                <button class="button primary compact" type="button" on:click={() => saveStorageConfig(config)}>保存配置</button>
+                <button class="button primary compact" type="button" on:click={() => saveStorageConfig(config)} disabled={savingStorageId === config.id}>{savingStorageId === config.id ? '保存中' : '保存配置'}</button>
                 <button class="button secondary compact" type="button" on:click={() => runStorageHealthCheck(config)}>健康检查</button>
               </div>
             </article>
@@ -1321,6 +1415,24 @@
             <button class="button primary compact" type="button" on:click={saveSiteSettings}>保存站点设置</button>
           </div>
         </article>
+      {:else if isCompressionPage}
+        <div class="section-heading"><p class="eyebrow">图片压缩</p><h2>动态图片压缩</h2><p>按用户组控制上传图片的压缩质量。系统会使用服务器 CPU 并发处理，只有压缩后更小时才替换原文件。</p></div>
+        <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
+        {#if userGroupError}<p class="form-error">{userGroupError}</p>{:else if userGroupMessage}<p class="form-success">{userGroupMessage}</p>{/if}
+        <div class="resource-list">
+          {#each userGroups as group}
+            <article class="detail-panel compression-panel">
+              <div class="subsection-heading"><h3>{group.name}</h3><p>{group.imageCompressionEnabled ? `当前压缩质量 ${clampCompressionQuality(group.imageCompressionQuality)}%` : '当前关闭图片压缩'}</p></div>
+              <div class="compression-control-grid">
+                <label class="toggle-row"><span>启用上传图片压缩</span><input bind:checked={group.imageCompressionEnabled} type="checkbox" /></label>
+                <label>压缩质量 {clampCompressionQuality(group.imageCompressionQuality)}%<input bind:value={group.imageCompressionQuality} type="range" min="50" max="80" step="1" disabled={!group.imageCompressionEnabled} /></label>
+                <label>精确数值<input bind:value={group.imageCompressionQuality} type="number" min="50" max="80" step="1" disabled={!group.imageCompressionEnabled} /></label>
+              </div>
+              <p class="muted-copy">50% 更小，80% 更接近原图。JPEG 会按质量重编码，PNG 使用无损最高压缩；GIF 保持原文件。</p>
+              <div class="resource-actions"><button class="button primary compact" type="button" on:click={() => saveUserGroup(group)} disabled={savingUserGroupId === group.id}>{savingUserGroupId === group.id ? '保存中' : '保存压缩设置'}</button></div>
+            </article>
+          {/each}
+        </div>
       {:else if isFeaturedAdminPage}
         <div class="section-heading"><p class="eyebrow">精选资源</p><h2>精选管理</h2><p>把资源加入探索广场，调整顺序，并控制首页展示的精选内容。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
@@ -1393,9 +1505,9 @@
         <div class="section-heading"><p class="eyebrow">资源库</p><h2>资源管理</h2><p>支持搜索、筛选、分页、软删除、恢复和详情查看。</p></div>
         <div class="admin-session">{#if currentUser}<span>当前账号：{currentUser.displayName} / {currentUser.groupName}</span>{:else if authReady}<span>需要管理员登录。</span><a class="inline-link" href="/login">去登录</a>{:else}<span>正在检查登录状态。</span>{/if}</div>
         <form class="resource-filter-grid" on:submit|preventDefault={applyResourceFilters}><label>搜索<input bind:value={resourceFilters.search} placeholder="文件名、扩展名或资源 ID" /></label><label>类型<select bind:value={resourceFilters.type}><option value="">全部</option>{#each resourceTypeOptions as option}<option value={option}>{resourceTypeLabel(option)}</option>{/each}</select></label><label>状态<select bind:value={resourceFilters.status}><option value="active">正常</option><option value="deleted">已删除</option><option value="all">全部</option></select></label><label>用户组<select bind:value={resourceFilters.userGroup}><option value="">全部</option>{#each groupOptions as option}<option value={option}>{groupLabel(option)}</option>{/each}</select></label><label>排序<select bind:value={resourceFilters.sort}><option value="created_desc">最新优先</option><option value="created_asc">最早优先</option></select></label><button class="button primary filter-submit" type="submit">应用筛选</button></form>
-        {#if resourceError}<p class="form-error">{resourceError}</p>{/if}
-        <div class="resource-toolbar"><span>共 {resourceTotal} 条资源</span><button class="button secondary compact" type="button" on:click={() => loadResources(resourcePage)} disabled={isLoadingResources}>{isLoadingResources ? '刷新中' : '刷新'}</button></div>
-        <div class="resource-list" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
+        {#if resourceError}<p class="form-error">{resourceError}</p>{:else if resourceMessage}<p class="form-success">{resourceMessage}</p>{/if}
+        <div class="resource-toolbar"><span>共 {resourceTotal} 条资源，当前每页 {resourcePageSize} 条</span><label class="resource-page-size">每页<select value={resourcePageSize} on:change={(event) => changeResourcePageSize((event.currentTarget as HTMLSelectElement).value)}>{#each resourcePageSizeOptions as option}<option value={option}>{option} 条</option>{/each}</select></label><button class="button secondary compact" type="button" on:click={() => loadResources(resourcePage, true)} disabled={isLoadingResources}>{isLoadingResources ? '刷新中' : '刷新'}</button></div>
+        <div class="resource-list capped" aria-live="polite">{#if isLoadingResources}<p>加载资源中…</p>{:else if resources.length === 0}<p>当前筛选条件下没有资源。</p>{:else}{#each resources as item}<article class="resource-row"><div class="resource-main"><div class="resource-title"><h3>{item.originalName}</h3><span>{resourceBadge(item)}</span></div><a class="inline-link" href={item.publicUrl} target="_blank" rel="noreferrer">{item.publicUrl}</a><p>创建于 {formatDateTime(item.createdAt)}</p></div><dl class="resource-stats-grid"><div><dt>访问</dt><dd>{item.accessCount}</dd></div><div><dt>总流量</dt><dd>{formatBytes(item.trafficBytes)}</dd></div><div><dt>月流量</dt><dd>{formatBytes(item.monthlyTraffic)} / {formatBytes(item.monthlyLimit)}</dd></div></dl><div class="resource-actions"><a class="button ghost compact" href={`/admin/resources/${item.id}`} on:click|preventDefault={() => navigate(`/admin/resources/${item.id}`)}>详情</a>{#if currentUser}{#if item.status === 'deleted'}<button class="button secondary compact" type="button" on:click={() => restoreResource(item.id)}>恢复</button>{:else}<button class="button secondary compact" type="button" on:click={() => deleteResource(item.id)}>删除</button>{/if}{/if}</div></article>{/each}{/if}</div>
         {#if resourceTotalPages > 1}<nav class="pagination" aria-label="资源分页"><button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage - 1)} disabled={resourcePage <= 1}>上一页</button>{#each pageRange() as pageNumber}<button class:active-page={pageNumber === resourcePage} class="button ghost compact" type="button" on:click={() => changeResourcePage(pageNumber)}>{pageNumber}</button>{/each}<button class="button ghost compact" type="button" on:click={() => changeResourcePage(resourcePage + 1)} disabled={resourcePage >= resourceTotalPages}>下一页</button></nav>{/if}
       {/if}
     </section>

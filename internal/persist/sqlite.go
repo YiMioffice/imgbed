@@ -601,7 +601,8 @@ func (s *SQLiteStore) UserByID(ctx context.Context, id string) (auth.User, error
 func (s *SQLiteStore) UserGroups(ctx context.Context) ([]UserGroup, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink, created_at, updated_at
+			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		ORDER BY created_at ASC
 	`)
@@ -623,11 +624,13 @@ func (s *SQLiteStore) UserGroups(ctx context.Context) ([]UserGroup, error) {
 
 func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (UserGroup, error) {
 	now := time.Now()
+	group = normalizeUserGroup(group)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO user_groups (
 			id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			image_compression_enabled, image_compression_quality, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -636,6 +639,8 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 			max_file_size_bytes = excluded.max_file_size_bytes,
 			daily_upload_limit = excluded.daily_upload_limit,
 			allow_hotlink = excluded.allow_hotlink,
+			image_compression_enabled = excluded.image_compression_enabled,
+			image_compression_quality = excluded.image_compression_quality,
 			updated_at = excluded.updated_at
 	`,
 		group.ID,
@@ -646,6 +651,8 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 		group.MaxFileSizeBytes,
 		group.DailyUploadLimit,
 		boolInt(group.AllowHotlink),
+		boolInt(group.ImageCompressionEnabled),
+		group.ImageCompressionQuality,
 		formatTime(now),
 		formatTime(now),
 	)
@@ -655,7 +662,8 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink, created_at, updated_at
+			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		WHERE id = ?
 	`, group.ID)
@@ -669,7 +677,8 @@ func (s *SQLiteStore) UserUsage(ctx context.Context, userID string) (UserUsage, 
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink, created_at, updated_at
+			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		WHERE id = ?
 	`, user.GroupID)
@@ -1420,9 +1429,27 @@ func (s *SQLiteStore) UpdateResourceVisibility(ctx context.Context, id string, i
 
 func (s *SQLiteStore) MarkResourceDeleted(ctx context.Context, id string) (resource.Record, error) {
 	now := time.Now()
-	if _, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return resource.Record{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 		UPDATE resources SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?
-	`, string(resource.StatusDeleted), formatTime(now), formatTime(now), id); err != nil {
+	`, string(resource.StatusDeleted), formatTime(now), formatTime(now), id)
+	if err != nil {
+		return resource.Record{}, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err == nil && rowsAffected == 0 {
+		return resource.Record{}, ErrNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE featured_resources SET is_active = 0, updated_at = ? WHERE resource_id = ?
+	`, formatTime(now), id); err != nil {
+		return resource.Record{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return resource.Record{}, err
 	}
 	return s.Resource(ctx, id)
@@ -1461,21 +1488,25 @@ func (s *SQLiteStore) AddResourceTraffic(ctx context.Context, params AddTrafficP
 	}
 	defer tx.Rollback()
 
+	accessIncrement := 1
+	if params.SkipAccessCount {
+		accessIncrement = 0
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE resources
-		SET access_count = access_count + 1,
+		SET access_count = access_count + ?,
 			traffic_bytes = traffic_bytes + ?,
 			monthly_traffic = ?,
 			month_window = ?,
 			updated_at = ?
 		WHERE id = ?
-	`, params.Bytes, monthlyTraffic, month, formatTime(params.AccessedAt), params.ResourceID); err != nil {
+	`, accessIncrement, params.Bytes, monthlyTraffic, month, formatTime(params.AccessedAt), params.ResourceID); err != nil {
 		return resource.Record{}, err
 	}
-	if err := s.bumpTrafficWindowTx(ctx, tx, params.ResourceID, params.UserID, record.Type, "day", day, params.Bytes, params.AccessedAt); err != nil {
+	if err := s.bumpTrafficWindowTx(ctx, tx, params.ResourceID, params.UserID, record.Type, "day", day, params.Bytes, accessIncrement, params.AccessedAt); err != nil {
 		return resource.Record{}, err
 	}
-	if err := s.bumpTrafficWindowTx(ctx, tx, params.ResourceID, params.UserID, record.Type, "month", month, params.Bytes, params.AccessedAt); err != nil {
+	if err := s.bumpTrafficWindowTx(ctx, tx, params.ResourceID, params.UserID, record.Type, "month", month, params.Bytes, accessIncrement, params.AccessedAt); err != nil {
 		return resource.Record{}, err
 	}
 	logID, err := newID("tlog")
@@ -1592,6 +1623,8 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			max_file_size_bytes INTEGER NOT NULL DEFAULT 0,
 			daily_upload_limit INTEGER NOT NULL DEFAULT 0,
 			allow_hotlink INTEGER NOT NULL DEFAULT 1,
+			image_compression_enabled INTEGER NOT NULL DEFAULT 1,
+			image_compression_quality INTEGER NOT NULL DEFAULT 50,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
@@ -1790,6 +1823,12 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "allow_hotlink", `ALTER TABLE user_groups ADD COLUMN allow_hotlink INTEGER NOT NULL DEFAULT 1`); err != nil {
 		return err
 	}
+	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "image_compression_enabled", `ALTER TABLE user_groups ADD COLUMN image_compression_enabled INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "image_compression_quality", `ALTER TABLE user_groups ADD COLUMN image_compression_quality INTEGER NOT NULL DEFAULT 50`); err != nil {
+		return err
+	}
 	if err := ensureSQLiteColumn(ctx, s.db, "storage_configs", "username", `ALTER TABLE storage_configs ADD COLUMN username TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
@@ -1817,8 +1856,8 @@ func (s *SQLiteStore) seedUserGroupsTx(ctx context.Context, exec execContext, no
 
 	for _, group := range groups {
 		if _, err := exec.ExecContext(ctx, `
-			INSERT INTO user_groups (id, name, description, allow_hotlink, created_at, updated_at)
-			VALUES (?, ?, ?, 1, ?, ?)
+			INSERT INTO user_groups (id, name, description, allow_hotlink, image_compression_enabled, image_compression_quality, created_at, updated_at)
+			VALUES (?, ?, ?, 1, 1, 50, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				name = excluded.name,
 				description = excluded.description,
@@ -1873,9 +1912,57 @@ func (s *SQLiteStore) seedRules(ctx context.Context, defaultRules []policy.Rule)
 		return err
 	}
 	if count > 0 {
-		return nil
+		return s.seedMissingDefaultRules(ctx, defaultRules)
 	}
 	return s.replaceRulesForGroup(ctx, policy.DefaultGroupID, defaultRules)
+}
+
+func (s *SQLiteStore) seedMissingDefaultRules(ctx context.Context, defaultRules []policy.Rule) error {
+	var position int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(position), -1) FROM policy_rules WHERE policy_group_id = ?`, policy.DefaultGroupID).Scan(&position); err != nil {
+		return err
+	}
+	for _, rule := range defaultRules {
+		var count int
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM policy_rules
+			WHERE policy_group_id = ? AND user_group = ? AND resource_type = ? AND extension = ?
+		`, policy.DefaultGroupID, rule.UserGroup, string(rule.ResourceType), rule.Extension).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			continue
+		}
+		position++
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO policy_rules (
+				policy_group_id, position, user_group, resource_type, extension, allow_upload, allow_access,
+				max_file_size_bytes, monthly_traffic_per_resource_bytes,
+				monthly_traffic_per_user_and_type_bytes, require_auth, require_review,
+				force_private, cache_control, download_disposition
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			policy.DefaultGroupID,
+			position,
+			rule.UserGroup,
+			string(rule.ResourceType),
+			rule.Extension,
+			boolInt(rule.AllowUpload),
+			boolInt(rule.AllowAccess),
+			rule.MaxFileSizeBytes,
+			rule.MonthlyTrafficPerResourceBytes,
+			rule.MonthlyTrafficPerUserAndTypeBytes,
+			boolInt(rule.RequireAuth),
+			boolInt(rule.RequireReview),
+			boolInt(rule.ForcePrivate),
+			rule.CacheControl,
+			rule.DownloadDisposition,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) seedSiteSettings(ctx context.Context) error {
@@ -2067,17 +2154,17 @@ func (s *SQLiteStore) resourceTrafficWindows(ctx context.Context, resourceID str
 	return windows, rows.Err()
 }
 
-func (s *SQLiteStore) bumpTrafficWindowTx(ctx context.Context, tx *sql.Tx, resourceID, userID string, resourceType resource.Type, windowType, windowKey string, bytes int64, updatedAt time.Time) error {
+func (s *SQLiteStore) bumpTrafficWindowTx(ctx context.Context, tx *sql.Tx, resourceID, userID string, resourceType resource.Type, windowType, windowKey string, bytes int64, requestCount int, updatedAt time.Time) error {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO resource_traffic_windows (
 			resource_id, user_id, resource_type, window_type, window_key, request_count, traffic_bytes, updated_at
-		) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(resource_id, user_id, window_type, window_key) DO UPDATE SET
 			resource_type = excluded.resource_type,
-			request_count = resource_traffic_windows.request_count + 1,
+			request_count = resource_traffic_windows.request_count + excluded.request_count,
 			traffic_bytes = resource_traffic_windows.traffic_bytes + excluded.traffic_bytes,
 			updated_at = excluded.updated_at
-	`, resourceID, userID, string(resourceType), windowType, windowKey, bytes, formatTime(updatedAt)); err != nil {
+	`, resourceID, userID, string(resourceType), windowType, windowKey, requestCount, bytes, formatTime(updatedAt)); err != nil {
 		return err
 	}
 	return nil
@@ -2235,6 +2322,7 @@ func scanResourceMetadata(row scanner) (resource.StoredMetadata, error) {
 func scanUserGroup(row scanner) (UserGroup, error) {
 	var group UserGroup
 	var allowHotlink boolInt
+	var imageCompressionEnabled boolInt
 	var createdAt string
 	var updatedAt string
 	if err := row.Scan(
@@ -2246,15 +2334,18 @@ func scanUserGroup(row scanner) (UserGroup, error) {
 		&group.MaxFileSizeBytes,
 		&group.DailyUploadLimit,
 		&allowHotlink,
+		&imageCompressionEnabled,
+		&group.ImageCompressionQuality,
 		&createdAt,
 		&updatedAt,
 	); err != nil {
 		return UserGroup{}, err
 	}
 	group.AllowHotlink = bool(allowHotlink)
+	group.ImageCompressionEnabled = bool(imageCompressionEnabled)
 	group.CreatedAt = parseTime(createdAt)
 	group.UpdatedAt = parseTime(updatedAt)
-	return group, nil
+	return normalizeUserGroup(group), nil
 }
 
 func scanResourceVariant(row scanner) (resource.Variant, error) {
