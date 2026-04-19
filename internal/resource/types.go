@@ -54,6 +54,7 @@ type Record struct {
 	IsPrivate       bool      `json:"isPrivate"`
 	StorageDriver   string    `json:"storageDriver"`
 	ObjectKey       string    `json:"objectKey"`
+	DeliveryRouteID string    `json:"deliveryRouteId,omitempty"`
 	PublicURL       string    `json:"publicUrl"`
 	OriginalName    string    `json:"originalName"`
 	Extension       string    `json:"extension"`

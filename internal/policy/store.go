@@ -21,7 +21,7 @@ type Store interface {
 	RulesForGroup(ctx context.Context, groupID string) ([]Rule, error)
 	PolicyGroup(ctx context.Context, groupID string) (Group, []Rule, error)
 	CreatePolicyGroup(ctx context.Context, name, description string) (Group, error)
-	UpdatePolicyGroup(ctx context.Context, groupID, name, description string) (Group, error)
+	UpdatePolicyGroup(ctx context.Context, group Group) (Group, error)
 	DeletePolicyGroup(ctx context.Context, groupID string) error
 	CopyPolicyGroup(ctx context.Context, sourceGroupID, name string) (Group, error)
 	SetPolicyGroupActive(ctx context.Context, groupID string, active bool) (Group, error)
@@ -39,12 +39,13 @@ func NewMemoryStore(rules []Rule) *MemoryStore {
 	return &MemoryStore{
 		groups: []Group{
 			{
-				ID:        DefaultGroupID,
-				Name:      DefaultGroupName,
-				IsActive:  true,
-				IsDefault: true,
-				CreatedAt: now,
-				UpdatedAt: now,
+				ID:                     DefaultGroupID,
+				Name:                   DefaultGroupName,
+				DefaultDeliveryRouteID: "default",
+				IsActive:               true,
+				IsDefault:              true,
+				CreatedAt:              now,
+				UpdatedAt:              now,
 			},
 		},
 		rulesByID: map[string][]Rule{
@@ -118,24 +119,28 @@ func (s *MemoryStore) CreatePolicyGroup(_ context.Context, name, description str
 	defer s.mu.Unlock()
 	now := time.Now()
 	group := Group{
-		ID:          fmt.Sprintf("group-%d", len(s.groups)+1),
-		Name:        name,
-		Description: description,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:                     fmt.Sprintf("group-%d", len(s.groups)+1),
+		Name:                   name,
+		Description:            description,
+		DefaultDeliveryRouteID: "default",
+		CreatedAt:              now,
+		UpdatedAt:              now,
 	}
 	s.groups = append(s.groups, group)
 	s.rulesByID[group.ID] = nil
 	return group, nil
 }
 
-func (s *MemoryStore) UpdatePolicyGroup(_ context.Context, groupID, name, description string) (Group, error) {
+func (s *MemoryStore) UpdatePolicyGroup(_ context.Context, group Group) (Group, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.groups {
-		if s.groups[i].ID == groupID {
-			s.groups[i].Name = name
-			s.groups[i].Description = description
+		if s.groups[i].ID == group.ID {
+			s.groups[i].Name = group.Name
+			s.groups[i].Description = group.Description
+			s.groups[i].DefaultDeliveryRouteID = group.DefaultDeliveryRouteID
+			s.groups[i].AllowedDeliveryRouteIDs = append([]string(nil), group.AllowedDeliveryRouteIDs...)
+			s.groups[i].AllowDeliveryRouteSelection = group.AllowDeliveryRouteSelection
 			s.groups[i].UpdatedAt = time.Now()
 			return s.groups[i], nil
 		}
@@ -171,14 +176,54 @@ func (s *MemoryStore) CopyPolicyGroup(_ context.Context, sourceGroupID, name str
 	sourceRules := append([]Rule(nil), s.rulesByID[sourceGroupID]...)
 	now := time.Now()
 	group := Group{
-		ID:        fmt.Sprintf("group-%d", len(s.groups)+1),
-		Name:      name,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:                          fmt.Sprintf("group-%d", len(s.groups)+1),
+		Name:                        name,
+		Description:                 sourceGroupDescription(s.groups, sourceGroupID),
+		DefaultDeliveryRouteID:      sourceGroupDefaultRoute(s.groups, sourceGroupID),
+		AllowedDeliveryRouteIDs:     sourceGroupAllowedRoutes(s.groups, sourceGroupID),
+		AllowDeliveryRouteSelection: sourceGroupAllowRouteSelection(s.groups, sourceGroupID),
+		CreatedAt:                   now,
+		UpdatedAt:                   now,
 	}
 	s.groups = append(s.groups, group)
 	s.rulesByID[group.ID] = sourceRules
 	return group, nil
+}
+
+func sourceGroupDescription(groups []Group, id string) string {
+	for _, group := range groups {
+		if group.ID == id {
+			return group.Description
+		}
+	}
+	return ""
+}
+
+func sourceGroupDefaultRoute(groups []Group, id string) string {
+	for _, group := range groups {
+		if group.ID == id {
+			return group.DefaultDeliveryRouteID
+		}
+	}
+	return ""
+}
+
+func sourceGroupAllowedRoutes(groups []Group, id string) []string {
+	for _, group := range groups {
+		if group.ID == id {
+			return append([]string(nil), group.AllowedDeliveryRouteIDs...)
+		}
+	}
+	return nil
+}
+
+func sourceGroupAllowRouteSelection(groups []Group, id string) bool {
+	for _, group := range groups {
+		if group.ID == id {
+			return group.AllowDeliveryRouteSelection
+		}
+	}
+	return false
 }
 
 func (s *MemoryStore) SetPolicyGroupActive(_ context.Context, groupID string, active bool) (Group, error) {

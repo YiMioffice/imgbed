@@ -42,11 +42,14 @@ type Decision struct {
 }
 
 type Group struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	IsActive    bool      `json:"isActive"`
-	IsDefault   bool      `json:"isDefault"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID                          string    `json:"id"`
+	Name                        string    `json:"name"`
+	Description                 string    `json:"description"`
+	DefaultDeliveryRouteID      string    `json:"defaultDeliveryRouteId,omitempty"`
+	AllowedDeliveryRouteIDs     []string  `json:"allowedDeliveryRouteIds,omitempty"`
+	AllowDeliveryRouteSelection bool      `json:"allowDeliveryRouteSelection"`
+	IsActive                    bool      `json:"isActive"`
+	IsDefault                   bool      `json:"isDefault"`
+	CreatedAt                   time.Time `json:"createdAt"`
+	UpdatedAt                   time.Time `json:"updatedAt"`
 }

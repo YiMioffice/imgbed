@@ -43,6 +43,10 @@ func NewSQLite(path string, defaultRules []policy.Rule) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.seedDeliveryRoutes(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := store.seedUserGroups(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -196,7 +200,8 @@ func (s *SQLiteStore) replaceRulesForGroup(ctx context.Context, groupID string, 
 
 func (s *SQLiteStore) ActivePolicyGroup(ctx context.Context) (policy.Group, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, description, is_active, is_default, created_at, updated_at
+		SELECT id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
 		FROM policy_groups
 		WHERE is_active = 1
 		ORDER BY is_default DESC, created_at ASC
@@ -211,7 +216,8 @@ func (s *SQLiteStore) ActivePolicyGroup(ctx context.Context) (policy.Group, erro
 
 func (s *SQLiteStore) PolicyGroups(ctx context.Context) ([]policy.Group, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, description, is_active, is_default, created_at, updated_at
+		SELECT id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
 		FROM policy_groups
 		ORDER BY is_default DESC, created_at ASC
 	`)
@@ -233,7 +239,8 @@ func (s *SQLiteStore) PolicyGroups(ctx context.Context) ([]policy.Group, error) 
 
 func (s *SQLiteStore) PolicyGroup(ctx context.Context, groupID string) (policy.Group, []policy.Rule, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, description, is_active, is_default, created_at, updated_at
+		SELECT id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
 		FROM policy_groups
 		WHERE id = ?
 	`, groupID)
@@ -255,8 +262,11 @@ func (s *SQLiteStore) CreatePolicyGroup(ctx context.Context, name, description s
 		return policy.Group{}, err
 	}
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO policy_groups (id, name, description, is_active, is_default, created_at, updated_at)
-		VALUES (?, ?, ?, 0, 0, ?, ?)
+		INSERT INTO policy_groups (
+			id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
+		)
+		VALUES (?, ?, ?, 'default', '[]', 0, 0, 0, ?, ?)
 	`, groupID, name, description, formatTime(now), formatTime(now)); err != nil {
 		return policy.Group{}, err
 	}
@@ -264,12 +274,17 @@ func (s *SQLiteStore) CreatePolicyGroup(ctx context.Context, name, description s
 	return group, err
 }
 
-func (s *SQLiteStore) UpdatePolicyGroup(ctx context.Context, groupID, name, description string) (policy.Group, error) {
+func (s *SQLiteStore) UpdatePolicyGroup(ctx context.Context, group policy.Group) (policy.Group, error) {
+	allowed, err := json.Marshal(group.AllowedDeliveryRouteIDs)
+	if err != nil {
+		return policy.Group{}, err
+	}
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE policy_groups
-		SET name = ?, description = ?, updated_at = ?
+		SET name = ?, description = ?, default_delivery_route_id = ?, allowed_delivery_route_ids = ?,
+			allow_delivery_route_selection = ?, updated_at = ?
 		WHERE id = ?
-	`, name, description, formatTime(time.Now()), groupID)
+	`, group.Name, group.Description, group.DefaultDeliveryRouteID, string(allowed), boolInt(group.AllowDeliveryRouteSelection), formatTime(time.Now()), group.ID)
 	if err != nil {
 		return policy.Group{}, err
 	}
@@ -277,8 +292,8 @@ func (s *SQLiteStore) UpdatePolicyGroup(ctx context.Context, groupID, name, desc
 	if err == nil && rowsAffected == 0 {
 		return policy.Group{}, policy.ErrPolicyGroupNotFound
 	}
-	group, _, err := s.PolicyGroup(ctx, groupID)
-	return group, err
+	updated, _, err := s.PolicyGroup(ctx, group.ID)
+	return updated, err
 }
 
 func (s *SQLiteStore) DeletePolicyGroup(ctx context.Context, groupID string) error {
@@ -331,10 +346,17 @@ func (s *SQLiteStore) CopyPolicyGroup(ctx context.Context, sourceGroupID, name s
 	if err != nil {
 		return policy.Group{}, err
 	}
+	allowed, err := json.Marshal(sourceGroup.AllowedDeliveryRouteIDs)
+	if err != nil {
+		return policy.Group{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO policy_groups (id, name, description, is_active, is_default, created_at, updated_at)
-		VALUES (?, ?, ?, 0, 0, ?, ?)
-	`, groupID, newName, sourceGroup.Description, formatTime(now), formatTime(now)); err != nil {
+		INSERT INTO policy_groups (
+			id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+	`, groupID, newName, sourceGroup.Description, sourceGroup.DefaultDeliveryRouteID, string(allowed), boolInt(sourceGroup.AllowDeliveryRouteSelection), formatTime(now), formatTime(now)); err != nil {
 		return policy.Group{}, err
 	}
 	for i, rule := range rules {
@@ -419,6 +441,7 @@ func (s *SQLiteStore) InstallState(ctx context.Context) (InstallState, error) {
 		DefaultStorage: "local",
 	}
 
+	initialized := false
 	row := s.db.QueryRowContext(ctx, `
 		SELECT u.username
 		FROM users u
@@ -431,13 +454,13 @@ func (s *SQLiteStore) InstallState(ctx context.Context) (InstallState, error) {
 	case err != nil:
 		return InstallState{}, err
 	default:
-		state.Initialized = true
+		initialized = true
 	}
 
 	settingsRows, err := s.db.QueryContext(ctx, `
 		SELECT key, value
 		FROM app_settings
-		WHERE key IN ('site_name', 'default_storage')
+		WHERE key IN ('site_name', 'default_storage', 'installation_initialized')
 	`)
 	if err != nil {
 		return InstallState{}, err
@@ -459,11 +482,24 @@ func (s *SQLiteStore) InstallState(ctx context.Context) (InstallState, error) {
 			if value != "" {
 				state.DefaultStorage = value
 			}
+		case "installation_initialized":
+			if strings.EqualFold(strings.TrimSpace(value), "true") || strings.TrimSpace(value) == "1" {
+				initialized = true
+			}
 		}
 	}
 	if err := settingsRows.Err(); err != nil {
 		return InstallState{}, err
 	}
+
+	if !initialized {
+		hasEvidence, err := s.hasUserManagedInstallationData(ctx, s.db)
+		if err != nil {
+			return InstallState{}, err
+		}
+		initialized = hasEvidence
+	}
+	state.Initialized = initialized
 
 	return state, nil
 }
@@ -488,6 +524,21 @@ func (s *SQLiteStore) Initialize(ctx context.Context, params InitializeParams) (
 		return auth.User{}, err
 	}
 
+	hasEvidence, err := s.hasUserManagedInstallationData(ctx, tx)
+	if err != nil {
+		return auth.User{}, err
+	}
+	if hasEvidence {
+		return auth.User{}, ErrAlreadyInitialized
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO app_settings (key, value, updated_at)
+		VALUES ('installation_initialized', 'true', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+	`, formatTime(now)); err != nil {
+		return auth.User{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO app_settings (key, value, updated_at)
 		VALUES ('site_name', ?, ?)
@@ -916,6 +967,83 @@ func (s *SQLiteStore) DefaultStorageConfig(ctx context.Context) (StorageConfig, 
 	return cfg, err
 }
 
+func (s *SQLiteStore) DeliveryRoutes(ctx context.Context) ([]DeliveryRoute, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, description, public_base_url, is_default, is_enabled, created_at, updated_at
+		FROM delivery_routes
+		ORDER BY is_default DESC, created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var routes []DeliveryRoute
+	for rows.Next() {
+		route, err := scanDeliveryRoute(rows)
+		if err != nil {
+			return nil, err
+		}
+		routes = append(routes, route)
+	}
+	return normalizeDeliveryRoutes(routes), rows.Err()
+}
+
+func (s *SQLiteStore) UpsertDeliveryRoute(ctx context.Context, route DeliveryRoute) (DeliveryRoute, error) {
+	route = normalizeDeliveryRoute(route)
+	if route.ID == "" {
+		route.ID = strings.ToLower(strings.ReplaceAll(route.Name, " ", "-"))
+		if route.ID == "" {
+			route.ID = "route"
+		}
+	}
+	now := time.Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeliveryRoute{}, err
+	}
+	defer tx.Rollback()
+	if route.IsDefault {
+		if _, err := tx.ExecContext(ctx, `UPDATE delivery_routes SET is_default = 0, updated_at = ?`, formatTime(now)); err != nil {
+			return DeliveryRoute{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO delivery_routes (id, name, description, public_base_url, is_default, is_enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			description = excluded.description,
+			public_base_url = excluded.public_base_url,
+			is_default = excluded.is_default,
+			is_enabled = excluded.is_enabled,
+			updated_at = excluded.updated_at
+	`, route.ID, route.Name, route.Description, route.PublicBaseURL, boolInt(route.IsDefault), boolInt(route.IsEnabled), formatTime(now), formatTime(now)); err != nil {
+		return DeliveryRoute{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeliveryRoute{}, err
+	}
+	return s.deliveryRouteByID(ctx, route.ID)
+}
+
+func (s *SQLiteStore) DeleteDeliveryRoute(ctx context.Context, id string) error {
+	route, err := s.deliveryRouteByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if route.IsDefault {
+		return errors.New("default delivery route cannot be deleted")
+	}
+	result, err := s.db.ExecContext(ctx, `DELETE FROM delivery_routes WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *SQLiteStore) SiteSettings(ctx context.Context) (SiteSettings, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT site_name, external_base_url, allow_guest_uploads, show_stats_on_home, show_featured_on_home, updated_at
@@ -999,7 +1127,7 @@ func (s *SQLiteStore) FeaturedResources(ctx context.Context, includeInactive boo
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT r.id, r.owner_user_id, r.owner_username, r.user_group, r.is_private, r.storage_driver, r.object_key, r.public_url, r.original_name,
+		SELECT r.id, r.owner_user_id, r.owner_username, r.user_group, r.is_private, r.storage_driver, r.object_key, r.delivery_route_id, r.public_url, r.original_name,
 			r.extension, r.resource_type, r.size, r.content_type, r.hash, r.status, r.access_count,
 			r.traffic_bytes, r.created_at, r.updated_at, r.deleted_at, r.cache_control,
 			r.disposition, r.monthly_limit, r.monthly_traffic, r.month_window, r.upload_ip, r.upload_user_agent,
@@ -1142,9 +1270,22 @@ func (s *SQLiteStore) storageConfigByID(ctx context.Context, id string) (Storage
 	return scanStorageConfig(row)
 }
 
+func (s *SQLiteStore) deliveryRouteByID(ctx context.Context, id string) (DeliveryRoute, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, description, public_base_url, is_default, is_enabled, created_at, updated_at
+		FROM delivery_routes
+		WHERE id = ?
+	`, id)
+	route, err := scanDeliveryRoute(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DeliveryRoute{}, ErrNotFound
+	}
+	return route, err
+}
+
 func (s *SQLiteStore) featuredResourceByID(ctx context.Context, resourceID string) (FeaturedResource, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT r.id, r.owner_user_id, r.owner_username, r.user_group, r.is_private, r.storage_driver, r.object_key, r.public_url, r.original_name,
+		SELECT r.id, r.owner_user_id, r.owner_username, r.user_group, r.is_private, r.storage_driver, r.object_key, r.delivery_route_id, r.public_url, r.original_name,
 			r.extension, r.resource_type, r.size, r.content_type, r.hash, r.status, r.access_count,
 			r.traffic_bytes, r.created_at, r.updated_at, r.deleted_at, r.cache_control,
 			r.disposition, r.monthly_limit, r.monthly_traffic, r.month_window, r.upload_ip, r.upload_user_agent,
@@ -1180,11 +1321,11 @@ func (s *SQLiteStore) CreateResource(ctx context.Context, bundle CreateResourceB
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO resources (
-			id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, public_url, original_name,
+			id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, delivery_route_id, public_url, original_name,
 			extension, resource_type, size, content_type, hash, status, access_count,
 			traffic_bytes, created_at, updated_at, deleted_at, cache_control,
 			disposition, monthly_limit, monthly_traffic, month_window, upload_ip, upload_user_agent
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		record.ID,
 		record.OwnerUserID,
@@ -1193,6 +1334,7 @@ func (s *SQLiteStore) CreateResource(ctx context.Context, bundle CreateResourceB
 		boolInt(record.IsPrivate),
 		record.StorageDriver,
 		record.ObjectKey,
+		record.DeliveryRouteID,
 		record.PublicURL,
 		record.OriginalName,
 		record.Extension,
@@ -1324,7 +1466,7 @@ func (s *SQLiteStore) ListResources(ctx context.Context, params resource.ListPar
 	}
 
 	query := `
-		SELECT id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, public_url, original_name,
+		SELECT id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, delivery_route_id, public_url, original_name,
 			extension, resource_type, size, content_type, hash, status, access_count,
 			traffic_bytes, created_at, updated_at, deleted_at, cache_control,
 			disposition, monthly_limit, monthly_traffic, month_window, upload_ip, upload_user_agent
@@ -1365,7 +1507,7 @@ func (s *SQLiteStore) ListResources(ctx context.Context, params resource.ListPar
 
 func (s *SQLiteStore) Resource(ctx context.Context, id string) (resource.Record, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, public_url, original_name,
+		SELECT id, owner_user_id, owner_username, user_group, is_private, storage_driver, object_key, delivery_route_id, public_url, original_name,
 			extension, resource_type, size, content_type, hash, status, access_count,
 			traffic_bytes, created_at, updated_at, deleted_at, cache_control,
 			disposition, monthly_limit, monthly_traffic, month_window, upload_ip, upload_user_agent
@@ -1700,10 +1842,24 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			updated_at TEXT NOT NULL
 		);
 
+		CREATE TABLE IF NOT EXISTS delivery_routes (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			public_base_url TEXT NOT NULL DEFAULT '',
+			is_default INTEGER NOT NULL DEFAULT 0,
+			is_enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+
 		CREATE TABLE IF NOT EXISTS policy_groups (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			description TEXT NOT NULL DEFAULT '',
+			default_delivery_route_id TEXT NOT NULL DEFAULT 'default',
+			allowed_delivery_route_ids TEXT NOT NULL DEFAULT '[]',
+			allow_delivery_route_selection INTEGER NOT NULL DEFAULT 0,
 			is_active INTEGER NOT NULL DEFAULT 0,
 			is_default INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
@@ -1737,6 +1893,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			is_private INTEGER NOT NULL DEFAULT 0,
 			storage_driver TEXT NOT NULL,
 			object_key TEXT NOT NULL,
+			delivery_route_id TEXT NOT NULL DEFAULT '',
 			public_url TEXT NOT NULL,
 			original_name TEXT NOT NULL,
 			extension TEXT NOT NULL,
@@ -1821,12 +1978,25 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS resource_variants_resource_idx ON resource_variants(resource_id, created_at);
 		CREATE INDEX IF NOT EXISTS resource_traffic_windows_window_idx ON resource_traffic_windows(window_type, window_key);
 		CREATE INDEX IF NOT EXISTS traffic_logs_resource_requested_idx ON traffic_logs(resource_id, requested_at);
+		CREATE INDEX IF NOT EXISTS delivery_routes_default_idx ON delivery_routes(is_default, is_enabled, updated_at);
 		CREATE INDEX IF NOT EXISTS featured_resources_active_sort_idx ON featured_resources(is_active, sort_order, updated_at);
 	`)
 	if err != nil {
 		return err
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "policy_rules", "policy_group_id", `ALTER TABLE policy_rules ADD COLUMN policy_group_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "policy_groups", "default_delivery_route_id", `ALTER TABLE policy_groups ADD COLUMN default_delivery_route_id TEXT NOT NULL DEFAULT 'default'`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "policy_groups", "allowed_delivery_route_ids", `ALTER TABLE policy_groups ADD COLUMN allowed_delivery_route_ids TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "policy_groups", "allow_delivery_route_selection", `ALTER TABLE policy_groups ADD COLUMN allow_delivery_route_selection INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "resources", "delivery_route_id", `ALTER TABLE resources ADD COLUMN delivery_route_id TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := ensureSQLiteColumn(ctx, s.db, "resources", "upload_ip", `ALTER TABLE resources ADD COLUMN upload_ip TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -1879,6 +2049,18 @@ func (s *SQLiteStore) seedUserGroups(ctx context.Context) error {
 	return s.seedUserGroupsTx(ctx, s.db, now)
 }
 
+func (s *SQLiteStore) seedDeliveryRoutes(ctx context.Context) error {
+	now := time.Now()
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO delivery_routes (id, name, description, public_base_url, is_default, is_enabled, created_at, updated_at)
+		VALUES ('default', '默认线路', '使用站点外部访问地址或服务默认地址。', '', 1, 1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			is_default = CASE WHEN delivery_routes.is_default = 0 THEN delivery_routes.is_default ELSE 1 END,
+			is_enabled = 1
+	`, formatTime(now), formatTime(now))
+	return err
+}
+
 func (s *SQLiteStore) seedUserGroupsTx(ctx context.Context, exec execContext, now time.Time) error {
 	groups := []struct {
 		ID                 string
@@ -1909,12 +2091,16 @@ func (s *SQLiteStore) seedUserGroupsTx(ctx context.Context, exec execContext, no
 func (s *SQLiteStore) seedPolicyGroups(ctx context.Context) error {
 	now := time.Now()
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO policy_groups (id, name, description, is_active, is_default, created_at, updated_at)
-		VALUES (?, ?, ?, 1, 1, ?, ?)
+		INSERT INTO policy_groups (
+			id, name, description, default_delivery_route_id, allowed_delivery_route_ids,
+			allow_delivery_route_selection, is_active, is_default, created_at, updated_at
+		)
+		VALUES (?, ?, ?, 'default', '[]', 0, 1, 1, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
-			is_default = 1
+			is_default = 1,
+			default_delivery_route_id = CASE WHEN policy_groups.default_delivery_route_id = '' THEN 'default' ELSE policy_groups.default_delivery_route_id END
 	`, policy.DefaultGroupID, policy.DefaultGroupName, "系统默认策略组", formatTime(now), formatTime(now)); err != nil {
 		return err
 	}
@@ -2104,6 +2290,27 @@ type execContext interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+type queryRowContext interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func (s *SQLiteStore) hasUserManagedInstallationData(ctx context.Context, queryer queryRowContext) (bool, error) {
+	var count int
+	err := queryer.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM users) +
+			(SELECT COUNT(*) FROM resources) +
+			(SELECT COUNT(*) FROM storage_configs) +
+			(SELECT COUNT(*) FROM featured_resources) +
+			(SELECT COUNT(*) FROM app_settings WHERE key IN ('installation_initialized', 'site_name', 'default_storage', 'resource_signing_secret')) +
+			(SELECT COUNT(*) FROM delivery_routes WHERE id <> 'default' OR public_base_url <> '')
+	`).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, alterSQL string) error {
 	exists, err := sqliteColumnExists(ctx, db, table, column)
 	if err != nil {
@@ -2257,6 +2464,7 @@ func scanResource(row scanner) (resource.Record, error) {
 		&isPrivate,
 		&record.StorageDriver,
 		&record.ObjectKey,
+		&record.DeliveryRouteID,
 		&record.PublicURL,
 		&record.OriginalName,
 		&record.Extension,
@@ -2308,6 +2516,7 @@ func scanFeaturedResource(row scanner) (FeaturedResource, error) {
 		&isPrivate,
 		&item.Resource.StorageDriver,
 		&item.Resource.ObjectKey,
+		&item.Resource.DeliveryRouteID,
 		&item.Resource.PublicURL,
 		&item.Resource.OriginalName,
 		&item.Resource.Extension,
@@ -2476,12 +2685,17 @@ func scanPolicyGroup(row scanner) (policy.Group, error) {
 	var group policy.Group
 	var isActive boolInt
 	var isDefault boolInt
+	var allowDeliveryRouteSelection boolInt
+	var allowedDeliveryRouteIDs string
 	var createdAt string
 	var updatedAt string
 	if err := row.Scan(
 		&group.ID,
 		&group.Name,
 		&group.Description,
+		&group.DefaultDeliveryRouteID,
+		&allowedDeliveryRouteIDs,
+		&allowDeliveryRouteSelection,
 		&isActive,
 		&isDefault,
 		&createdAt,
@@ -2489,11 +2703,52 @@ func scanPolicyGroup(row scanner) (policy.Group, error) {
 	); err != nil {
 		return policy.Group{}, err
 	}
+	group.AllowedDeliveryRouteIDs = decodeStringList(allowedDeliveryRouteIDs)
+	group.AllowDeliveryRouteSelection = bool(allowDeliveryRouteSelection)
 	group.IsActive = bool(isActive)
 	group.IsDefault = bool(isDefault)
 	group.CreatedAt = parseTime(createdAt)
 	group.UpdatedAt = parseTime(updatedAt)
 	return group, nil
+}
+
+func scanDeliveryRoute(row scanner) (DeliveryRoute, error) {
+	var route DeliveryRoute
+	var isDefault boolInt
+	var isEnabled boolInt
+	var createdAt string
+	var updatedAt string
+	if err := row.Scan(
+		&route.ID,
+		&route.Name,
+		&route.Description,
+		&route.PublicBaseURL,
+		&isDefault,
+		&isEnabled,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return DeliveryRoute{}, err
+	}
+	route.IsDefault = bool(isDefault)
+	route.IsEnabled = bool(isEnabled)
+	route.CreatedAt = parseTime(createdAt)
+	route.UpdatedAt = parseTime(updatedAt)
+	return normalizeDeliveryRoute(route), nil
+}
+
+func decodeStringList(raw string) []string {
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return []string{}
+	}
+	cleaned := values[:0]
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+	return cleaned
 }
 
 func newID(prefix string) (string, error) {

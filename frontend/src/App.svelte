@@ -21,11 +21,11 @@
 
   type AuthUser = { id: string; username: string; displayName: string; role: string; groupId: string; groupName: string; status: string };
   type InstallState = { initialized: boolean; siteName: string; defaultStorage: string; adminUsername: string };
-  type PolicyGroup = { id: string; name: string; description: string; isActive: boolean; isDefault: boolean; createdAt: string; updatedAt: string };
+  type PolicyGroup = { id: string; name: string; description: string; defaultDeliveryRouteId?: string; allowedDeliveryRouteIds?: string[]; allowDeliveryRouteSelection: boolean; isActive: boolean; isDefault: boolean; createdAt: string; updatedAt: string };
   type PolicyRule = { userGroup: string; resourceType: string; extension?: string; allowUpload: boolean; allowAccess: boolean; maxFileSizeBytes: number; monthlyTrafficPerResourceBytes: number; monthlyTrafficPerUserAndTypeBytes: number; requireAuth: boolean; requireReview: boolean; forcePrivate: boolean; cacheControl?: string; downloadDisposition?: string };
   type PolicyDecision = { allowed: boolean; reason: string; rule: PolicyRule };
   type PolicyTestResponse = { metadata: { filename: string; extension: string; type: string; contentType: string; size: number }; decision: PolicyDecision; policyGroup: PolicyGroup };
-  type ResourceRecord = { id: string; userGroup: string; isPrivate: boolean; storageDriver: string; objectKey: string; publicUrl: string; originalName: string; extension: string; type: string; size: number; contentType: string; hash: string; status: string; accessCount: number; trafficBytes: number; monthlyTraffic: number; monthlyLimit: number; monthWindow: string; cacheControl?: string; disposition?: string; createdAt: string; updatedAt: string; uploadIp?: string; uploadUserAgent?: string };
+  type ResourceRecord = { id: string; userGroup: string; isPrivate: boolean; storageDriver: string; objectKey: string; deliveryRouteId?: string; publicUrl: string; originalName: string; extension: string; type: string; size: number; contentType: string; hash: string; status: string; accessCount: number; trafficBytes: number; monthlyTraffic: number; monthlyLimit: number; monthWindow: string; cacheControl?: string; disposition?: string; createdAt: string; updatedAt: string; uploadIp?: string; uploadUserAgent?: string };
   type ResourceLinks = { direct: string; markdown: string; html: string; bbcode: string };
   type ResourceDetail = { record: ResourceRecord; metadata: { resourceId: string; headerSha256: string; imageWidth: number; imageHeight: number; imageDecoded: boolean }; variants: Array<{ id: string; kind: string; objectKey: string; contentType: string; size: number; width: number; height: number }>; links: ResourceLinks; trafficWindows: Array<{ windowType: string; windowKey: string; requestCount: number; trafficBytes: number }> };
   type SignedLinkResult = { url: string; expiresAt: string };
@@ -36,12 +36,15 @@
   type AccountUsage = { user?: AuthUser | null; group: UserGroup; usedStorageBytes: number; monthlyTrafficBytes: number; dailyUploadCount: number };
   type ManagedUser = AuthUser;
   type StorageConfig = { id: string; type: string; name: string; endpoint: string; region: string; bucket: string; accessKeyId: string; secretAccessKey?: string; username?: string; password?: string; publicBaseUrl: string; basePath: string; usePathStyle: boolean; isDefault: boolean; createdAt?: string; updatedAt?: string };
+  type DeliveryRoute = { id: string; name: string; description: string; publicBaseUrl: string; isDefault: boolean; isEnabled: boolean; createdAt?: string; updatedAt?: string };
   type SiteSettings = { siteName: string; externalBaseUrl: string; allowGuestUploads: boolean; showStatsOnHome: boolean; showFeaturedOnHome: boolean; updatedAt?: string };
   type FeaturedResource = { resource: ResourceRecord; sortOrder: number; createdAt: string; updatedAt: string };
 
   const groupOptions = ['guest', 'user', 'admin'];
   const resourceTypeOptions = ['image', 'script', 'stylesheet', 'archive', 'executable', 'document', 'font', 'video', 'other'];
   const resourcePageSizeOptions = [8, 12, 24];
+  const homeFeaturedLimit = 6;
+  const exploreFeaturedPageSize = 12;
   const megabyte = 1024 * 1024;
   const gigabyte = 1024 * 1024 * 1024;
   const groupLabels: Record<string, string> = { guest: '游客', user: '登录用户', admin: '管理员' };
@@ -106,6 +109,8 @@
   let homeStatsReady = false;
   let featuredResources: FeaturedResource[] = [];
   let featuredReady = false;
+  let explorePage = 1;
+  let galleryModalResource: ResourceRecord | null = null;
 
   let installForm = { siteName: '马赫环', defaultStorage: 'local', adminUsername: 'owner', displayName: '管理员', password: '', confirmPassword: '' };
   let installError = '';
@@ -176,6 +181,13 @@
   let savingStorageId = '';
   let checkingStorageId = '';
   let storageHealthResult = '';
+  let deliveryRoutes: DeliveryRoute[] = [];
+  let uploadDeliveryRoutes: DeliveryRoute[] = [];
+  let selectedDeliveryRouteId = '';
+  let allowDeliveryRouteSelection = false;
+  let deliveryRouteError = '';
+  let deliveryRouteMessage = '';
+  let savingDeliveryRouteId = '';
   let siteSettingsError = '';
   let siteSettingsMessage = '';
   let isSavingSiteSettings = false;
@@ -196,6 +208,8 @@
     policyGroups: 20_000,
     policies: 20_000,
     storageConfigs: 20_000,
+    deliveryRoutes: 20_000,
+    deliveryRouteChoices: 20_000,
     resources: 10_000,
     resourceDetail: 10_000
   } as const;
@@ -210,6 +224,8 @@
     users: 0,
     policyGroups: 0,
     storageConfigs: 0,
+    deliveryRoutes: 0,
+    deliveryRouteChoices: 0,
     resources: 0
   };
   let resourcesCacheKey = '';
@@ -280,12 +296,15 @@
       featured
     });
   }
+  function isKnownUninitialized() {
+    return installReady && installState?.initialized === false && !currentUser && !installLoadError;
+  }
 
   async function handleRouteChange() {
     const route = resolveRouteState(path);
     const token = ++routeLoadToken;
     const initialized = installState?.initialized || !!currentUser;
-    const knownUninitialized = installReady && installState?.initialized === false && !currentUser;
+    const knownUninitialized = isKnownUninitialized();
 
     if (knownUninitialized && (path === '/login' || path === '/account' || path.startsWith('/admin'))) {
       await navigate('/install', true);
@@ -308,10 +327,12 @@
     if (path === '/' || route.isDashboardPage) tasks.push(loadHomeStats());
     if (path === '/' || route.isExplorePage || route.isFeaturedAdminPage) tasks.push(loadFeaturedResources(true));
     if (path === '/upload' || route.isAccountPage) tasks.push(loadAccountUsage());
+    if (path === '/upload') tasks.push(loadDeliveryRouteChoices());
 
     if (currentUser?.role === 'admin' && route.isAdminProtectedPage) {
       if (route.isDashboardPage) tasks.push(loadDashboardData());
       if (route.isPolicyPage) tasks.push(loadPolicyEditor());
+      if (route.isPolicyPage) tasks.push(loadDeliveryRoutes());
       if (route.isUserGroupPage) tasks.push(loadUserGroups());
       if (route.isUserPage) tasks.push(loadUserAdminData());
       if (route.isStoragePage) tasks.push(loadStorageConfigs());
@@ -463,6 +484,7 @@
   async function initializeSite() {
     installError = '';
     if (installLoadError) return void (installError = installLoadError);
+    if (!isKnownUninitialized()) return void (installError = '当前系统不是可初始化状态。为避免覆盖已有数据，请先确认后端初始化状态。');
     if (installForm.password.length < 8) return void (installError = '密码至少需要 8 位。');
     if (installForm.password !== installForm.confirmPassword) return void (installError = '两次输入的密码不一致。');
     isInitializing = true;
@@ -483,7 +505,7 @@
   }
 
   async function login() {
-    if (installReady && installState?.initialized === false && !currentUser) return jump('/install');
+    if (isKnownUninitialized()) return jump('/install');
     isLoggingIn = true;
     loginError = '';
     try {
@@ -565,19 +587,36 @@
         }
       };
       xhr.onload = () => {
-        try {
-          const payload = xhr.responseText ? JSON.parse(xhr.responseText) : {};
-          if (xhr.status >= 200 && xhr.status < 300) return resolve(payload);
-          reject(new Error(payload.error?.message || payload.error || '上传失败'));
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error('上传失败'));
-        }
+        const payload = parseUploadResponse(xhr);
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(payload);
+        reject(new Error(uploadHTTPErrorMessage(xhr.status, payload)));
       };
       xhr.onerror = () => reject(new Error('上传请求失败'));
       const form = new FormData();
+      if (selectedDeliveryRouteId) form.append('deliveryRouteId', selectedDeliveryRouteId);
       files.forEach((file) => form.append('files', file, file.name));
       xhr.send(form);
     });
+  }
+
+  function parseUploadResponse(xhr: XMLHttpRequest) {
+    const text = xhr.responseText?.trim() ?? '';
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { error: { message: uploadHTTPErrorMessage(xhr.status, null) } };
+    }
+  }
+
+  function uploadHTTPErrorMessage(status: number, payload: any) {
+    const message = payload?.error?.message || payload?.error;
+    if (message) return translateSystemMessage(message);
+    if (status === 413) return '上传体积超过网关或反向代理限制，请调高 client_max_body_size / 平台上传限制后重试。';
+    if (status === 429) return '上传请求过于频繁，请稍后重试。';
+    if (status >= 500) return '服务器处理上传失败，请检查后端或存储服务状态。';
+    if (status > 0) return `上传失败：HTTP ${status}`;
+    return '上传请求失败';
   }
 
   function estimateItemProgress(files: File[], index: number, ratio: number) {
@@ -618,6 +657,9 @@
   async function createPolicyGroup() { policyGroupError = ''; if (!policyGroupForm.name.trim()) return void (policyGroupError = '请输入策略组名称。'); isCreatingPolicyGroup = true; try { const res = await fetch('/api/v1/policy-groups', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(policyGroupForm) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '创建策略组失败'); policyGroupForm = { name: '', description: '' }; selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '创建策略组失败'; } finally { isCreatingPolicyGroup = false; } }
   async function copyPolicyGroup(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/copy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `${group.name} 副本` }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '复制策略组失败'); selectedPolicyGroupId = payload.group.id; await loadPolicyEditor(payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '复制策略组失败'; } }
   async function setPolicyGroupActive(group: PolicyGroup, active: boolean) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${group.id}/${active ? 'activate' : 'deactivate'}`, { method: 'POST' }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '更新策略组状态失败'); await loadPolicyEditor(selectedPolicyGroupId || payload.group.id); } catch (error) { policyGroupError = error instanceof Error ? error.message : '更新策略组状态失败'; } }
+  function policyGroupAllowedRouteIds(group: PolicyGroup) { return group.allowedDeliveryRouteIds?.length ? group.allowedDeliveryRouteIds : deliveryRoutes.map((route) => route.id); }
+  function togglePolicyGroupRoute(group: PolicyGroup, routeId: string) { const set = new Set(policyGroupAllowedRouteIds(group)); if (set.has(routeId)) set.delete(routeId); else set.add(routeId); group.allowedDeliveryRouteIds = Array.from(set); policyGroups = [...policyGroups]; }
+  async function savePolicyGroupSettings(group: PolicyGroup) { policyGroupError = ''; try { const res = await fetch(`/api/v1/policy-groups/${encodeURIComponent(group.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, defaultDeliveryRouteId: group.defaultDeliveryRouteId || deliveryRoutes.find((route) => route.isDefault)?.id || 'default', allowedDeliveryRouteIds: policyGroupAllowedRouteIds(group), allowDeliveryRouteSelection: !!group.allowDeliveryRouteSelection }) }); const payload = await res.json(); if (!res.ok) return void (policyGroupError = payload.error ?? '保存策略组设置失败'); policyGroupError = ''; policySaveMessage = '策略组线路设置已保存。'; invalidateCache('policyGroups', 'deliveryRouteChoices'); await loadPolicyGroups(true); await loadDeliveryRouteChoices(true); } catch (error) { policyGroupError = error instanceof Error ? error.message : '保存策略组设置失败'; } }
   async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.delete(selectedPolicyGroupId); cacheTimestamps.policyGroups = 0; policySaveMessage = '策略已保存。'; await loadPolicyGroups(true); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
   async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: unitToBytes(String(policyForm.size), megabyte) }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
   async function loadUserGroups(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.userGroups, cacheTTL.userGroups)) return; if (!silent) { userGroupError = ''; userGroupMessage = ''; } return runDeduped('userGroups', async () => { try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; cacheTimestamps.userGroups = Date.now(); } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }); }
@@ -685,6 +727,59 @@
     } finally {
       savingStorageId = '';
     }
+  }
+  async function loadDeliveryRoutes(force = false) {
+    if (!force && isFresh(cacheTimestamps.deliveryRoutes, cacheTTL.deliveryRoutes)) return;
+    deliveryRouteError = '';
+    deliveryRouteMessage = '';
+    return runDeduped('deliveryRoutes', async () => {
+      try {
+        const res = await fetch('/api/v1/delivery-routes');
+        const payload = await res.json();
+        if (!res.ok) return void (deliveryRouteError = payload.error ?? '加载访问线路失败');
+        deliveryRoutes = payload.routes ?? [];
+        cacheTimestamps.deliveryRoutes = Date.now();
+      } catch (error) {
+        deliveryRouteError = error instanceof Error ? error.message : '加载访问线路失败';
+      }
+    });
+  }
+  async function loadDeliveryRouteChoices(force = false) {
+    if (!force && isFresh(cacheTimestamps.deliveryRouteChoices, cacheTTL.deliveryRouteChoices)) return;
+    return runDeduped('deliveryRouteChoices', async () => {
+      try {
+        const res = await fetch('/api/v1/delivery-routes/choices');
+        const payload = await res.json();
+        if (!res.ok) return;
+        uploadDeliveryRoutes = payload.routes ?? [];
+        allowDeliveryRouteSelection = !!payload.allowDeliveryRouteSelection;
+        selectedDeliveryRouteId = payload.defaultDeliveryRouteId || uploadDeliveryRoutes.find((route) => route.isDefault)?.id || uploadDeliveryRoutes[0]?.id || '';
+        cacheTimestamps.deliveryRouteChoices = Date.now();
+      } catch {
+        uploadDeliveryRoutes = [];
+      }
+    });
+  }
+  async function saveDeliveryRoute(route: DeliveryRoute) {
+    deliveryRouteError = '';
+    deliveryRouteMessage = '';
+    savingDeliveryRouteId = route.id;
+    try {
+      const res = await fetch(`/api/v1/delivery-routes/${encodeURIComponent(route.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(route) });
+      const payload = await res.json();
+      if (!res.ok) return void (deliveryRouteError = payload.error ?? '保存访问线路失败');
+      deliveryRouteMessage = `${payload.route?.name ?? route.name} 已保存。`;
+      invalidateCache('deliveryRoutes', 'deliveryRouteChoices');
+      await loadDeliveryRoutes(true);
+    } catch (error) {
+      deliveryRouteError = error instanceof Error ? error.message : '保存访问线路失败';
+    } finally {
+      savingDeliveryRouteId = '';
+    }
+  }
+  async function addDeliveryRoute() {
+    const id = `route-${deliveryRoutes.length + 1}`;
+    deliveryRoutes = [...deliveryRoutes, { id, name: '新访问线路', description: '', publicBaseUrl: '', isDefault: false, isEnabled: true }];
   }
   async function runStorageHealthCheck(config: StorageConfig) {
     storageError = '';
@@ -917,6 +1012,10 @@
   async function readJSON(res: Response) { try { return await res.json(); } catch { return { error: res.ok ? '' : `请求失败：HTTP ${res.status}` }; } }
   function formatDateTime(value: string) { if (!value) return '无'; const date = new Date(value); if (Number.isNaN(date.getTime())) return value; return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`; }
   function pageRange() { if (resourceTotalPages <= 1) return []; const start = Math.max(1, resourcePage - 2); const end = Math.min(resourceTotalPages, resourcePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
+  function exploreTotalPages() { return Math.max(1, Math.ceil(featuredResources.length / exploreFeaturedPageSize)); }
+  function explorePageRange() { const total = exploreTotalPages(); if (total <= 1) return []; const start = Math.max(1, explorePage - 2); const end = Math.min(total, explorePage + 2); return Array.from({ length: end - start + 1 }, (_, index) => start + index); }
+  function exploreFeaturedResources() { const total = exploreTotalPages(); if (explorePage > total) explorePage = total; if (explorePage < 1) explorePage = 1; const start = (explorePage - 1) * exploreFeaturedPageSize; return featuredResources.slice(start, start + exploreFeaturedPageSize); }
+  function changeExplorePage(page: number) { explorePage = Math.min(Math.max(1, page), exploreTotalPages()); window.scrollTo({ top: 0, behavior: 'smooth' }); }
   function groupLabel(value: string) { return groupLabels[value] ?? value; }
   function resourceTypeLabel(value: string) { return resourceTypeLabels[value] ?? value; }
   function dispositionLabel(value?: string) { return value === 'attachment' ? '强制下载' : '页面内打开'; }
@@ -943,7 +1042,11 @@
   function resourceBadge(record: ResourceRecord) { return `${resourceTypeLabel(record.type)} · ${formatBytes(record.size)} · ${record.isPrivate ? '私有' : '公开'} · ${record.status === 'deleted' ? '已删除' : '正常'}`; }
   function securityHint(record: ResourceRecord) { if (record.isPrivate) return '私有资源默认拒绝匿名直链访问，可使用签名链接按时效开放。'; if (record.type === 'image') return '图片资源可直接预览。'; if (record.type === 'video') return '视频资源可在详情页内直接预览。'; if (record.type === 'script' || record.type === 'executable') return '脚本和可执行资源会强制下载，避免浏览器直接执行。'; return '非图片资源展示类型、大小、下载策略和安全提示。'; }
   function isFeaturedResource(resourceId: string) { return featuredResources.some((item) => item.resource.id === resourceId); }
-  function homeFeaturedResources() { return featuredResources.slice(0, 4); }
+  function homeFeaturedResources() { return featuredResources.slice(0, homeFeaturedLimit); }
+  function featuredOverflowCount() { return Math.max(0, featuredResources.length - homeFeaturedLimit); }
+  function openGalleryModal(record: ResourceRecord) { galleryModalResource = record; copyMessage = ''; }
+  function closeGalleryModal() { galleryModalResource = null; }
+  function monthlyUsageLabel(record: ResourceRecord) { return record.monthlyLimit > 0 ? `${formatBytes(record.monthlyTraffic)} / ${formatBytes(record.monthlyLimit)}` : `${formatBytes(record.monthlyTraffic)} / 不限`; }
   function quotaHint(group?: UserGroup | null) { if (!group) return '当前没有用户组配额信息。'; const parts: string[] = []; if (group.maxFileSizeBytes > 0) parts.push(`单文件 ${formatBytes(group.maxFileSizeBytes)}`); if (group.totalCapacityBytes > 0) parts.push(`总容量 ${formatBytes(group.totalCapacityBytes)}`); if (group.dailyUploadLimit > 0) parts.push(`每日 ${group.dailyUploadLimit} 次`); if (group.dailyIpUploadLimit > 0) parts.push(`同 IP 每日 ${group.dailyIpUploadLimit} 次`); if (group.defaultMonthlyTrafficBytes > 0) parts.push(`默认月流量 ${formatBytes(group.defaultMonthlyTrafficBytes)}`); return parts.length > 0 ? parts.join(' · ') : '当前用户组未设置额外配额。'; }
   function findStorageConfig(configs: StorageConfig[], id: string, type: string) { return configs.find((config) => config.id === id) ?? configs.find((config) => config.type === type); }
   function ensureStorageConfig(config: Partial<StorageConfig>, type: string): StorageConfig {
@@ -982,16 +1085,21 @@
     <section class="glass-panel page-panel">
       <p class="eyebrow">马赫环静态托管</p>
       <h1>初始化</h1>
-      <form class="resource-form" on:submit|preventDefault={initializeSite}>
-        <label>站点名称<input bind:value={installForm.siteName} /></label>
-        <label>默认存储<select bind:value={installForm.defaultStorage}><option value="local">本机存储</option></select></label>
-        <label>管理员账号<input bind:value={installForm.adminUsername} autocomplete="username" /></label>
-        <label>昵称<input bind:value={installForm.displayName} /></label>
-        <label>密码<input bind:value={installForm.password} type="password" autocomplete="new-password" /></label>
-        <label>确认密码<input bind:value={installForm.confirmPassword} type="password" autocomplete="new-password" /></label>
-        {#if installError || installLoadError}<p class="form-error">{installError || installLoadError}</p>{/if}
-        <button class="button primary" type="submit" disabled={isInitializing || !installReady}>{isInitializing ? '初始化中' : '创建管理员'}</button>
-      </form>
+      {#if !isKnownUninitialized()}
+        <p class="form-error">{installLoadError || '当前系统不是可初始化状态。为避免覆盖已有数据，初始化入口已锁定。'}</p>
+        <div class="actions"><a class="button secondary" href="/" on:click|preventDefault={() => navigate('/')}>返回首页</a><a class="button ghost" href="/login">去登录</a></div>
+      {:else}
+        <form class="resource-form" on:submit|preventDefault={initializeSite}>
+          <label>站点名称<input bind:value={installForm.siteName} /></label>
+          <label>默认存储<select bind:value={installForm.defaultStorage}><option value="local">本机存储</option></select></label>
+          <label>管理员账号<input bind:value={installForm.adminUsername} autocomplete="username" /></label>
+          <label>昵称<input bind:value={installForm.displayName} /></label>
+          <label>密码<input bind:value={installForm.password} type="password" autocomplete="new-password" /></label>
+          <label>确认密码<input bind:value={installForm.confirmPassword} type="password" autocomplete="new-password" /></label>
+          {#if installError || installLoadError}<p class="form-error">{installError || installLoadError}</p>{/if}
+          <button class="button primary" type="submit" disabled={isInitializing || !installReady}>{isInitializing ? '初始化中' : '创建管理员'}</button>
+        </form>
+      {/if}
     </section>
   </main>
 {:else if path === '/upload'}
@@ -1006,7 +1114,9 @@
         </div>
         <div class="summary-card"><span>今日上传</span><strong>{homeStats.todayUploads}</strong></div>
       </div>
-      {#if installReady && !installState?.initialized}
+      {#if installLoadError}
+        <p class="form-error">无法确认站点初始化状态：{installLoadError}</p>
+      {:else if isKnownUninitialized()}
         <p class="lead compact">请先完成管理员初始化，再开放上传入口。</p>
         <a class="button primary" href="/install">去初始化</a>
       {:else}
@@ -1026,6 +1136,17 @@
               <small>{accountUsage ? `已用 ${formatBytes(accountUsage.usedStorageBytes)} · 今日 ${accountUsage.dailyUploadCount} 次 · ${compressionHint(accountUsage.group)}` : '加载中'}</small>
             </article>
           </div>
+          {#if uploadDeliveryRoutes.length > 0}
+            <label class="route-select-card">
+              <span>访问线路</span>
+              <select bind:value={selectedDeliveryRouteId} disabled={!allowDeliveryRouteSelection || uploadDeliveryRoutes.length <= 1}>
+                {#each uploadDeliveryRoutes as route}
+                  <option value={route.id}>{route.name}{route.publicBaseUrl ? ` · ${route.publicBaseUrl}` : ' · 默认站点地址'}</option>
+                {/each}
+              </select>
+              <small>{allowDeliveryRouteSelection ? '本次上传返回所选线路的直链。' : '当前策略组由管理员固定访问线路。'}</small>
+            </label>
+          {/if}
           {#if accountError}<p class="form-error">{accountError}</p>{/if}
           <input id="file-picker" class="sr-only" type="file" multiple on:change={handleUploadSelection} />
           <div class:dragging={isDragging} class="drop-zone" role="button" tabindex="0" aria-label="资源上传拖拽区域" on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') document.getElementById('file-picker')?.click(); }} on:dragenter|preventDefault={() => isDragging = true} on:dragover|preventDefault={() => isDragging = true} on:dragleave|preventDefault={() => isDragging = false} on:drop={handleDrop}>
@@ -1308,6 +1429,39 @@
             </form>
             {#if policyGroupError}<p class="form-error">{policyGroupError}</p>{/if}
             <div class="policy-group-list">{#each policyGroups as item}<article class:selected={item.id === selectedPolicyGroupId} class="policy-group-card"><button class="policy-group-select" type="button" on:click={() => loadPolicyEditor(item.id)}><strong>{item.name}</strong><span>{item.isActive ? '已启用' : '未启用'}{item.isDefault ? ' · 默认' : ''}</span></button><p>{item.description || '暂无说明'}</p><div class="policy-group-actions"><button class="button secondary compact" type="button" on:click={() => copyPolicyGroup(item)} disabled={!currentUser}>复制</button>{#if item.isActive}<button class="button secondary compact" type="button" on:click={() => setPolicyGroupActive(item, false)} disabled={!currentUser}>停用</button>{:else}<button class="button primary compact" type="button" on:click={() => setPolicyGroupActive(item, true)} disabled={!currentUser}>启用</button>{/if}</div></article>{/each}</div>
+            {#if selectedPolicyGroupId}
+              {#each policyGroups.filter((group) => group.id === selectedPolicyGroupId) as selectedGroup}
+                <div class="route-policy-card">
+                  <div class="subsection-heading"><h3>策略组访问线路</h3><p>上传时按这里决定默认直链线路，并控制是否允许上传者选择。</p></div>
+                  <label>默认线路<select bind:value={selectedGroup.defaultDeliveryRouteId}>{#each deliveryRoutes as route}<option value={route.id}>{route.name}</option>{/each}</select></label>
+                  <label class="toggle-row"><span>允许上传者选择线路</span><input bind:checked={selectedGroup.allowDeliveryRouteSelection} type="checkbox" /></label>
+                  <div class="route-checkboxes">
+                    {#each deliveryRoutes as route}
+                      <label><input type="checkbox" checked={policyGroupAllowedRouteIds(selectedGroup).includes(route.id)} on:change={() => togglePolicyGroupRoute(selectedGroup, route.id)} /> <span>{route.name}</span></label>
+                    {/each}
+                  </div>
+                  <button class="button primary compact" type="button" on:click={() => savePolicyGroupSettings(selectedGroup)}>保存线路策略</button>
+                </div>
+              {/each}
+            {/if}
+            <div class="route-policy-card">
+              <div class="subsection-heading"><h3>访问线路</h3><p>可自定义任意反代入口，例如大陆优化、下载专线或备用节点。</p></div>
+              {#if deliveryRouteError}<p class="form-error">{deliveryRouteError}</p>{:else if deliveryRouteMessage}<p class="form-success">{deliveryRouteMessage}</p>{/if}
+              <button class="button secondary compact" type="button" on:click={addDeliveryRoute}>新增线路</button>
+              <div class="route-config-list">
+                {#each deliveryRoutes as route}
+                  <article class="route-config-card">
+                    <label>ID<input bind:value={route.id} disabled={!!route.createdAt} /></label>
+                    <label>名称<input bind:value={route.name} /></label>
+                    <label>入口地址<input bind:value={route.publicBaseUrl} placeholder="https://cdn.example.com，留空使用默认站点地址" /></label>
+                    <label>说明<input bind:value={route.description} /></label>
+                    <label class="toggle-row"><span>启用</span><input bind:checked={route.isEnabled} type="checkbox" /></label>
+                    <label class="toggle-row"><span>默认线路</span><input bind:checked={route.isDefault} type="checkbox" /></label>
+                    <button class="button primary compact" type="button" on:click={() => saveDeliveryRoute(route)} disabled={savingDeliveryRouteId === route.id}>{savingDeliveryRouteId === route.id ? '保存中' : '保存线路'}</button>
+                  </article>
+                {/each}
+              </div>
+            </div>
           </section>
           <section class="policy-editor-panel">
             <div class="subsection-heading"><h3>规则编辑</h3><p>当前编辑：{policyGroups.find((group) => group.id === selectedPolicyGroupId)?.name ?? '未选择策略组'}</p></div>
@@ -1548,41 +1702,54 @@
         <div>
           <p class="eyebrow">探索广场</p>
           <h1>探索广场</h1>
-          <p class="lead compact">公开展示管理员精选的静态资源。图片直接预览，非图片展示类型和大小。</p>
+          <p class="lead compact">精选资源以画廊形式展示，每页最多 {exploreFeaturedPageSize} 个，点击卡片可查看访问、流量和存储信息。</p>
         </div>
-        <div class="summary-card"><span>精选数量</span><strong>{featuredResources.length}</strong></div>
+        <div class="summary-card"><span>精选数量</span><strong>{featuredResources.length}</strong><small>第 {explorePage} / {exploreTotalPages()} 页</small></div>
       </div>
       {#if featuredError}<p class="form-error">{featuredError}</p>{/if}
-      <div class="resource-list">
+      <div class="gallery-grid explore-gallery" aria-live="polite">
         {#if !featuredReady}
           <p>精选资源加载中…</p>
         {:else if featuredResources.length === 0}
           <p>当前还没有公开精选资源。</p>
         {:else}
-          {#each featuredResources as item}
-            <article class="detail-panel">
-              <div class="subsection-heading">
-                <h3>{item.resource.originalName}</h3>
-                <p>{resourceBadge(item.resource)}</p>
-              </div>
+          {#each exploreFeaturedResources() as item}
+            <article class="gallery-card">
               {#if item.resource.type === 'image'}
-                <div class="preview-panel">
-                  <img src={item.resource.publicUrl} alt={item.resource.originalName} />
+                <div class="gallery-preview">
+                  <img loading="lazy" src={item.resource.publicUrl} alt={item.resource.originalName} />
                 </div>
               {:else}
-                <div class="preview-panel muted">
-                  <strong>{item.resource.type}</strong>
+                <div class="gallery-preview muted">
+                  <strong>{resourceTypeLabel(item.resource.type)}</strong>
                   <span>{formatBytes(item.resource.size)}</span>
                 </div>
               {/if}
-              <div class="resource-actions">
-                <a class="button primary compact" href={item.resource.publicUrl} target="_blank" rel="noreferrer">打开资源</a>
-                <a class="button secondary compact" href={item.resource.publicUrl} target="_blank" rel="noreferrer">复制直链后访问</a>
+              <div class="gallery-card-body">
+                <p class="gallery-kind">{resourceTypeLabel(item.resource.type)} · {formatBytes(item.resource.size)}</p>
+                <h3>{item.resource.originalName}</h3>
+                <dl>
+                  <div><dt>访问</dt><dd>{item.resource.accessCount}</dd></div>
+                  <div><dt>流量</dt><dd>{formatBytes(item.resource.trafficBytes)}</dd></div>
+                </dl>
+              </div>
+              <div class="gallery-actions">
+                <button class="button primary compact" type="button" on:click={() => openGalleryModal(item.resource)}>查看数据</button>
+                <a class="button secondary compact" href={item.resource.publicUrl} target="_blank" rel="noreferrer">打开资源</a>
               </div>
             </article>
           {/each}
         {/if}
       </div>
+      {#if featuredReady && exploreTotalPages() > 1}
+        <nav class="pagination gallery-pagination" aria-label="探索广场分页">
+          <button class="button ghost compact" type="button" on:click={() => changeExplorePage(explorePage - 1)} disabled={explorePage <= 1}>上一页</button>
+          {#each explorePageRange() as pageNumber}
+            <button class:active-page={pageNumber === explorePage} class="button ghost compact" type="button" on:click={() => changeExplorePage(pageNumber)} aria-current={pageNumber === explorePage ? 'page' : undefined}>{pageNumber}</button>
+          {/each}
+          <button class="button ghost compact" type="button" on:click={() => changeExplorePage(explorePage + 1)} disabled={explorePage >= exploreTotalPages()}>下一页</button>
+        </nav>
+      {/if}
     </section>
   </main>
 {:else}
@@ -1592,7 +1759,7 @@
         <p class="eyebrow">马赫环静态托管</p>
         <h1>{siteName}</h1>
         <p class="lead">统一托管图片、脚本、压缩包、可执行文件与其他静态资源，大陆优化网络，免登录上传。</p>
-        <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}{#if !currentUser || currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>后台</a>{/if}{:else}<a class="button primary" href="/install">初始化</a>{/if}</div>
+        <div class="actions" aria-label="主要操作">{#if installState?.initialized}<a class="button primary" href="/upload">上传</a><a class="button secondary" href="/explore">探索广场</a>{#if currentUser}<a class="button ghost" href="/account">账户</a>{:else}<a class="button ghost" href="/login">登录</a>{/if}{#if !currentUser || currentUser.role === 'admin'}<a class="button secondary" href="/admin" on:click|preventDefault={() => navigate('/admin')}>后台</a>{/if}{:else if isKnownUninitialized()}<a class="button primary" href="/install">初始化</a>{:else}<span class="button ghost disabled">状态检查失败</span>{/if}</div>
       </div>
       {#if siteSettings.showStatsOnHome}
         <div class="hero-stats">
@@ -1611,29 +1778,29 @@
           <div>
             <p class="eyebrow">Featured</p>
             <h2>精选资源</h2>
-            <p class="lead compact">从探索广场中展示一部分精选内容。</p>
+            <p class="lead compact">首页最多展示 {homeFeaturedLimit} 个精选资源，更多内容进入探索广场翻页浏览。</p>
           </div>
-          <a class="button secondary compact" href="/explore">查看全部</a>
+          <a class="button secondary compact" href="/explore">查看全部{#if featuredOverflowCount() > 0} +{featuredOverflowCount()}{/if}</a>
         </div>
-        <div class="resource-list">
+        <div class="gallery-grid home-gallery">
           {#if featuredResources.length === 0}
             <p>当前还没有精选资源。</p>
           {:else}
             {#each homeFeaturedResources() as item}
-              <article class="resource-row featured-row">
-                <div class="resource-main">
-                  <div class="resource-title"><h3>{item.resource.originalName}</h3><span>{resourceBadge(item.resource)}</span></div>
-                  <a class="inline-link" href={item.resource.publicUrl} target="_blank" rel="noreferrer">{item.resource.publicUrl}</a>
+              <article class="gallery-card compact-gallery-card">
+                {#if item.resource.type === 'image'}
+                  <div class="gallery-preview">
+                    <img loading="lazy" src={item.resource.publicUrl} alt={item.resource.originalName} />
+                  </div>
+                {:else}
+                  <div class="gallery-preview muted"><strong>{resourceTypeLabel(item.resource.type)}</strong><span>{formatBytes(item.resource.size)}</span></div>
+                {/if}
+                <div class="gallery-card-body">
+                  <p class="gallery-kind">{resourceTypeLabel(item.resource.type)} · {formatBytes(item.resource.size)}</p>
+                  <h3>{item.resource.originalName}</h3>
                 </div>
-                <div class="featured-preview">
-                  {#if item.resource.type === 'image'}
-                    <img src={item.resource.publicUrl} alt={item.resource.originalName} />
-                  {:else}
-                    <div class="preview-panel muted"><strong>{item.resource.type}</strong><span>{formatBytes(item.resource.size)}</span></div>
-                  {/if}
-                </div>
-                <div class="resource-actions">
-                  <a class="button primary compact" href={item.resource.publicUrl} target="_blank" rel="noreferrer">打开资源</a>
+                <div class="gallery-actions">
+                  <button class="button primary compact" type="button" on:click={() => openGalleryModal(item.resource)}>查看数据</button>
                 </div>
               </article>
             {/each}
@@ -1642,4 +1809,43 @@
       </section>
     {/if}
   </main>
+{/if}
+
+{#if galleryModalResource}
+  <div class="gallery-modal-backdrop" role="presentation" on:click|self={closeGalleryModal}>
+    <div class="gallery-modal" role="dialog" aria-modal="true" aria-labelledby="gallery-modal-title">
+      <button class="modal-close" type="button" aria-label="关闭资源数据弹窗" on:click={closeGalleryModal}>×</button>
+      <div class="gallery-modal-preview">
+        {#if galleryModalResource.type === 'image'}
+          <img src={galleryModalResource.publicUrl} alt={galleryModalResource.originalName} />
+        {:else}
+          <div class="gallery-preview muted"><strong>{resourceTypeLabel(galleryModalResource.type)}</strong><span>{formatBytes(galleryModalResource.size)}</span></div>
+        {/if}
+      </div>
+      <div class="gallery-modal-info">
+        <p class="eyebrow">Resource Data</p>
+        <h2 id="gallery-modal-title">{galleryModalResource.originalName}</h2>
+        <p class="lead compact">{securityHint(galleryModalResource)}</p>
+        <dl class="gallery-data-grid">
+          <div><dt>类型</dt><dd>{resourceTypeLabel(galleryModalResource.type)}</dd></div>
+          <div><dt>大小</dt><dd>{formatBytes(galleryModalResource.size)}</dd></div>
+          <div><dt>访问次数</dt><dd>{galleryModalResource.accessCount}</dd></div>
+          <div><dt>累计流量</dt><dd>{formatBytes(galleryModalResource.trafficBytes)}</dd></div>
+          <div><dt>本月流量</dt><dd>{monthlyUsageLabel(galleryModalResource)}</dd></div>
+          <div><dt>上传时间</dt><dd>{formatDateTime(galleryModalResource.createdAt)}</dd></div>
+          <div><dt>存储驱动</dt><dd>{galleryModalResource.storageDriver}</dd></div>
+          <div><dt>可见性</dt><dd>{galleryModalResource.isPrivate ? '私有' : '公开'}</dd></div>
+        </dl>
+        <div class="gallery-link-box">
+          <span>{galleryModalResource.publicUrl}</span>
+          <button class="button secondary compact" type="button" on:click={() => copyToClipboard(galleryModalResource?.publicUrl ?? '')}>复制直链</button>
+        </div>
+        {#if copyMessage}<p class="form-success">{copyMessage}</p>{/if}
+        <div class="resource-actions">
+          <a class="button primary compact" href={galleryModalResource.publicUrl} target="_blank" rel="noreferrer">打开资源</a>
+          <button class="button ghost compact" type="button" on:click={closeGalleryModal}>关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
 {/if}

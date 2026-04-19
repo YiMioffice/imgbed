@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
@@ -80,6 +81,10 @@ func (api *API) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/storage-configs", api.storageConfigs)
 	mux.HandleFunc("PUT /api/v1/storage-configs/{id}", api.upsertStorageConfig)
 	mux.HandleFunc("POST /api/v1/storage-configs/health-check", api.storageHealthCheck)
+	mux.HandleFunc("GET /api/v1/delivery-routes", api.deliveryRoutes)
+	mux.HandleFunc("PUT /api/v1/delivery-routes/{id}", api.upsertDeliveryRoute)
+	mux.HandleFunc("DELETE /api/v1/delivery-routes/{id}", api.deleteDeliveryRoute)
+	mux.HandleFunc("GET /api/v1/delivery-routes/choices", api.deliveryRouteChoices)
 	mux.HandleFunc("GET /api/v1/featured-resources", api.featuredResources)
 	mux.HandleFunc("POST /api/v1/featured-resources", api.addFeaturedResource)
 	mux.HandleFunc("DELETE /api/v1/featured-resources/{id}", api.removeFeaturedResource)
@@ -245,8 +250,11 @@ type replacePoliciesRequest struct {
 }
 
 type policyGroupRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name                        string   `json:"name"`
+	Description                 string   `json:"description"`
+	DefaultDeliveryRouteID      string   `json:"defaultDeliveryRouteId"`
+	AllowedDeliveryRouteIDs     []string `json:"allowedDeliveryRouteIds"`
+	AllowDeliveryRouteSelection bool     `json:"allowDeliveryRouteSelection"`
 }
 
 type copyPolicyGroupRequest struct {
@@ -332,7 +340,14 @@ func (api *API) updatePolicyGroup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "policy group name is required"})
 		return
 	}
-	group, err := api.app.PolicyStore.UpdatePolicyGroup(r.Context(), r.PathValue("id"), req.Name, req.Description)
+	group, err := api.app.PolicyStore.UpdatePolicyGroup(r.Context(), policy.Group{
+		ID:                          r.PathValue("id"),
+		Name:                        req.Name,
+		Description:                 req.Description,
+		DefaultDeliveryRouteID:      strings.TrimSpace(req.DefaultDeliveryRouteID),
+		AllowedDeliveryRouteIDs:     cleanStringList(req.AllowedDeliveryRouteIDs),
+		AllowDeliveryRouteSelection: req.AllowDeliveryRouteSelection,
+	})
 	if errors.Is(err, policy.ErrPolicyGroupNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "policy group not found"})
 		return
@@ -644,6 +659,15 @@ type storageConfigRequest struct {
 	IsDefault       bool   `json:"isDefault"`
 }
 
+type deliveryRouteRequest struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	PublicBaseURL string `json:"publicBaseUrl"`
+	IsDefault     bool   `json:"isDefault"`
+	IsEnabled     bool   `json:"isEnabled"`
+}
+
 type siteSettingsRequest struct {
 	SiteName           string `json:"siteName"`
 	ExternalBaseURL    string `json:"externalBaseUrl"`
@@ -775,7 +799,15 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]uploadItemResponse, len(files))
 	successes := 0
-	publicBaseURL := api.publicResourceBaseURL(settings)
+	requestedDeliveryRouteID := strings.TrimSpace(r.FormValue("deliveryRouteId"))
+	deliveryRoute, err := api.resolveUploadDeliveryRoute(r.Context(), requestedDeliveryRouteID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "delivery_route_invalid", Message: err.Error()},
+		})
+		return
+	}
+	publicBaseURL := api.publicResourceBaseURLForRoute(settings, deliveryRoute)
 	workerCount := uploadWorkerCount(len(files))
 	if api.shouldSerializeUploads(r.Context(), group) {
 		workerCount = 1
@@ -788,7 +820,7 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 			go func() {
 				defer wg.Done()
 				for index := range jobs {
-					items[index] = api.handleUploadFile(r.Context(), actorPtr, group, files[index], clientAddr, r.UserAgent(), publicBaseURL)
+					items[index] = api.handleUploadFile(r.Context(), actorPtr, group, files[index], clientAddr, r.UserAgent(), publicBaseURL, deliveryRoute.ID)
 				}
 			}()
 		}
@@ -799,7 +831,7 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 		wg.Wait()
 	} else {
 		for index, header := range files {
-			items[index] = api.handleUploadFile(r.Context(), actorPtr, group, header, clientAddr, r.UserAgent(), publicBaseURL)
+			items[index] = api.handleUploadFile(r.Context(), actorPtr, group, header, clientAddr, r.UserAgent(), publicBaseURL, deliveryRoute.ID)
 		}
 	}
 	for _, item := range items {
@@ -1209,6 +1241,82 @@ func (api *API) storageHealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (api *API) deliveryRoutes(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
+	routes, err := api.app.Data.DeliveryRoutes(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to load delivery routes", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"routes": routes})
+}
+
+func (api *API) upsertDeliveryRoute(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
+	var req deliveryRouteRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("invalid delivery route payload", err))
+		return
+	}
+	route := persist.DeliveryRoute{
+		ID:            firstNonEmpty(strings.TrimSpace(r.PathValue("id")), strings.TrimSpace(req.ID)),
+		Name:          strings.TrimSpace(req.Name),
+		Description:   strings.TrimSpace(req.Description),
+		PublicBaseURL: strings.TrimRight(strings.TrimSpace(req.PublicBaseURL), "/"),
+		IsDefault:     req.IsDefault,
+		IsEnabled:     req.IsEnabled,
+	}
+	if route.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "delivery route name is required"})
+		return
+	}
+	if route.PublicBaseURL != "" && !strings.HasPrefix(route.PublicBaseURL, "http://") && !strings.HasPrefix(route.PublicBaseURL, "https://") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "delivery route public base url must start with http:// or https://"})
+		return
+	}
+	saved, err := api.app.Data.UpsertDeliveryRoute(r.Context(), route)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to save delivery route", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"route": saved})
+}
+
+func (api *API) deleteDeliveryRoute(w http.ResponseWriter, r *http.Request) {
+	if _, ok := api.requireAdmin(w, r); !ok {
+		return
+	}
+	err := api.app.Data.DeleteDeliveryRoute(r.Context(), r.PathValue("id"))
+	if errors.Is(err, persist.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "delivery route not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("failed to delete delivery route", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (api *API) deliveryRouteChoices(w http.ResponseWriter, r *http.Request) {
+	routes, group, err := api.deliveryRouteChoicesForActivePolicy(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to load delivery route choices", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"routes":                      routes,
+		"defaultDeliveryRouteId":      group.DefaultDeliveryRouteID,
+		"allowDeliveryRouteSelection": group.AllowDeliveryRouteSelection,
+	})
+}
+
 func (api *API) featuredResources(w http.ResponseWriter, r *http.Request) {
 	items, err := api.app.Data.FeaturedResources(r.Context(), false)
 	if err != nil {
@@ -1601,6 +1709,14 @@ func (api *API) serveResource(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.Method == http.MethodGet {
+		if redirectURL := api.deliveryRouteRedirectURL(r, record); redirectURL != "" {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Location", redirectURL)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+	}
 
 	_, resourceStore, _, err := api.resolveStoreByID(r.Context(), record.StorageDriver)
 	if err != nil {
@@ -1703,7 +1819,7 @@ func (api *API) addResourceTraffic(ctx context.Context, record resource.Record, 
 	})
 }
 
-func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group string, header *multipart.FileHeader, uploadIP, userAgent, publicBaseURL string) uploadItemResponse {
+func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group string, header *multipart.FileHeader, uploadIP, userAgent, publicBaseURL, deliveryRouteID string) uploadItemResponse {
 	cleanedName := sanitizeUploadFilename(header.Filename)
 	item := uploadItemResponse{
 		Status:   http.StatusCreated,
@@ -1857,6 +1973,7 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 		IsPrivate:       decision.Rule.ForcePrivate,
 		StorageDriver:   defaultStorageID,
 		ObjectKey:       object.Key,
+		DeliveryRouteID: deliveryRouteID,
 		PublicURL:       directURL,
 		OriginalName:    cleanedName,
 		Extension:       meta.Extension,
@@ -2285,6 +2402,117 @@ func (api *API) publicResourceBaseURL(settings persist.SiteSettings) string {
 	return strings.TrimRight(strings.TrimSpace(api.app.Config.PublicBaseURL), "/")
 }
 
+func (api *API) publicResourceBaseURLForRoute(settings persist.SiteSettings, route persist.DeliveryRoute) string {
+	if base := strings.TrimRight(strings.TrimSpace(route.PublicBaseURL), "/"); base != "" {
+		return base
+	}
+	return api.publicResourceBaseURL(settings)
+}
+
+func (api *API) resolveUploadDeliveryRoute(ctx context.Context, requestedID string) (persist.DeliveryRoute, error) {
+	routes, group, err := api.deliveryRouteChoicesForActivePolicy(ctx)
+	if err != nil {
+		return persist.DeliveryRoute{}, err
+	}
+	routeByID := map[string]persist.DeliveryRoute{}
+	for _, route := range routes {
+		routeByID[route.ID] = route
+	}
+	selectedID := strings.TrimSpace(group.DefaultDeliveryRouteID)
+	if group.AllowDeliveryRouteSelection && strings.TrimSpace(requestedID) != "" {
+		selectedID = strings.TrimSpace(requestedID)
+	}
+	if selectedID == "" {
+		for _, route := range routes {
+			if route.IsDefault {
+				selectedID = route.ID
+				break
+			}
+		}
+	}
+	route, ok := routeByID[selectedID]
+	if !ok {
+		return persist.DeliveryRoute{}, errors.New("selected delivery route is not allowed")
+	}
+	return route, nil
+}
+
+func (api *API) deliveryRouteChoicesForActivePolicy(ctx context.Context) ([]persist.DeliveryRoute, policy.Group, error) {
+	routes, err := api.app.Data.DeliveryRoutes(ctx)
+	if err != nil {
+		return nil, policy.Group{}, err
+	}
+	group, err := api.app.PolicyStore.ActivePolicyGroup(ctx)
+	if err != nil {
+		return nil, policy.Group{}, err
+	}
+	enabled := make([]persist.DeliveryRoute, 0, len(routes))
+	for _, route := range routes {
+		if route.IsEnabled {
+			enabled = append(enabled, route)
+		}
+	}
+	if len(enabled) == 0 {
+		enabled = append(enabled, persist.DeliveryRoute{ID: "default", Name: "默认线路", IsDefault: true, IsEnabled: true})
+	}
+	if strings.TrimSpace(group.DefaultDeliveryRouteID) == "" {
+		for _, route := range enabled {
+			if route.IsDefault {
+				group.DefaultDeliveryRouteID = route.ID
+				break
+			}
+		}
+	}
+	allowedIDs := cleanStringList(group.AllowedDeliveryRouteIDs)
+	if len(allowedIDs) == 0 {
+		group.AllowedDeliveryRouteIDs = routeIDs(enabled)
+		return enabled, group, nil
+	}
+	allowedSet := map[string]bool{}
+	for _, id := range allowedIDs {
+		allowedSet[id] = true
+	}
+	filtered := enabled[:0]
+	for _, route := range enabled {
+		if allowedSet[route.ID] {
+			filtered = append(filtered, route)
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = enabled
+		group.AllowedDeliveryRouteIDs = routeIDs(enabled)
+	} else {
+		group.AllowedDeliveryRouteIDs = allowedIDs
+	}
+	return filtered, group, nil
+}
+
+func (api *API) deliveryRouteRedirectURL(r *http.Request, record resource.Record) string {
+	if strings.TrimSpace(record.DeliveryRouteID) == "" || strings.TrimSpace(record.DeliveryRouteID) == "default" || strings.TrimSpace(record.PublicURL) == "" {
+		return ""
+	}
+	target, err := url.Parse(record.PublicURL)
+	if err != nil || target.Host == "" {
+		return ""
+	}
+	requestHosts := []string{requestHost(r), strings.TrimSpace(r.Header.Get("Host")), strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))}
+	for _, host := range requestHosts {
+		if strings.EqualFold(host, target.Host) {
+			return ""
+		}
+	}
+	if r.URL.RawQuery != "" {
+		query := target.Query()
+		for key, values := range r.URL.Query() {
+			for _, value := range values {
+				query.Add(key, value)
+			}
+		}
+		target.RawQuery = query.Encode()
+	}
+	return target.String()
+}
+
 func (api *API) resolveDefaultStore(ctx context.Context) (string, storage.Store, persist.StorageConfig, error) {
 	cfg, err := api.app.Data.DefaultStorageConfig(ctx)
 	if err != nil {
@@ -2509,6 +2737,30 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func cleanStringList(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func routeIDs(routes []persist.DeliveryRoute) []string {
+	ids := make([]string, 0, len(routes))
+	for _, route := range routes {
+		if strings.TrimSpace(route.ID) != "" {
+			ids = append(ids, route.ID)
+		}
+	}
+	return ids
 }
 
 func (api *API) loadPolicyGroup(ctx context.Context, groupID string) (policy.Group, []policy.Rule, error) {

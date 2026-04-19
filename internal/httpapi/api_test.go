@@ -307,6 +307,93 @@ func TestUploadCreatesResourceAndServesDirectLink(t *testing.T) {
 	}
 }
 
+func TestUploadWithCustomDeliveryRouteReturnsRouteURL(t *testing.T) {
+	api := testAPI(t, true)
+
+	routeReq := httptest.NewRequest(http.MethodPut, "/api/v1/delivery-routes/fast", bytes.NewBufferString(`{
+		"name":"高速下载",
+		"description":"下载专线",
+		"publicBaseUrl":"https://fast.example.test",
+		"isDefault":false,
+		"isEnabled":true
+	}`))
+	addAdminCookie(t, api, routeReq)
+	routeReq.Header.Set("Content-Type", "application/json")
+	routeRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(routeRec, routeReq)
+	if routeRec.Code != http.StatusOK {
+		t.Fatalf("route save status = %d, want %d; body: %s", routeRec.Code, http.StatusOK, routeRec.Body.String())
+	}
+
+	groupReq := httptest.NewRequest(http.MethodPatch, "/api/v1/policy-groups/"+policy.DefaultGroupID, bytes.NewBufferString(`{
+		"name":"默认策略组",
+		"description":"系统默认策略组",
+		"defaultDeliveryRouteId":"fast",
+		"allowedDeliveryRouteIds":["fast"],
+		"allowDeliveryRouteSelection":true
+	}`))
+	addAdminCookie(t, api, groupReq)
+	groupReq.Header.Set("Content-Type", "application/json")
+	groupRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(groupRec, groupReq)
+	if groupRec.Code != http.StatusOK {
+		t.Fatalf("group save status = %d, want %d; body: %s", groupRec.Code, http.StatusOK, groupRec.Body.String())
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("deliveryRouteId", "fast"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("file", "sample.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(tinyPNG); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	uploadReq := httptest.NewRequest(http.MethodPost, "/api/v1/resources/upload", &body)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(uploadRec, uploadReq)
+	if uploadRec.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d; body: %s", uploadRec.Code, http.StatusCreated, uploadRec.Body.String())
+	}
+	var payload struct {
+		Resource resource.Record `json:"resource"`
+	}
+	if err := json.NewDecoder(uploadRec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Resource.DeliveryRouteID != "fast" {
+		t.Fatalf("delivery route id = %q, want fast", payload.Resource.DeliveryRouteID)
+	}
+	if !strings.HasPrefix(payload.Resource.PublicURL, "https://fast.example.test/r/") {
+		t.Fatalf("public url = %q, want fast route", payload.Resource.PublicURL)
+	}
+
+	originReq := httptest.NewRequest(http.MethodGet, "/r/"+payload.Resource.ID, nil)
+	originRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(originRec, originReq)
+	if originRec.Code != http.StatusFound {
+		t.Fatalf("origin serve status = %d, want %d; body: %s", originRec.Code, http.StatusFound, originRec.Body.String())
+	}
+	if got := originRec.Header().Get("Location"); got != payload.Resource.PublicURL {
+		t.Fatalf("origin redirect = %q, want %q", got, payload.Resource.PublicURL)
+	}
+
+	routeReq2 := httptest.NewRequest(http.MethodGet, payload.Resource.PublicURL, nil)
+	routeRec2 := httptest.NewRecorder()
+	api.Routes().ServeHTTP(routeRec2, routeReq2)
+	if routeRec2.Code != http.StatusOK {
+		t.Fatalf("route serve status = %d, want %d; body: %s", routeRec2.Code, http.StatusOK, routeRec2.Body.String())
+	}
+}
+
 func TestJPEGUploadAppliesGroupCompression(t *testing.T) {
 	api := testAPI(t, true)
 	guestGroup := lookupGroup(t, api, policy.GroupGuest)
@@ -1222,6 +1309,59 @@ func TestInstallStateAndSetup(t *testing.T) {
 	api.Routes().ServeHTTP(repeatRec, repeatReq)
 	if repeatRec.Code != http.StatusConflict {
 		t.Fatalf("repeat setup status = %d, want %d; body: %s", repeatRec.Code, http.StatusConflict, repeatRec.Body.String())
+	}
+}
+
+func TestInstallSetupBlockedWhenExistingDataHasNoAdmin(t *testing.T) {
+	api := testAPI(t, false)
+	now := time.Now()
+	err := api.app.Data.CreateResource(context.Background(), persist.CreateResourceBundle{
+		Record: resource.Record{
+			ID:            "res_existing",
+			UserGroup:     policy.GroupGuest,
+			StorageDriver: "local",
+			ObjectKey:     "legacy/sample.png",
+			PublicURL:     "http://example.test/r/res_existing",
+			OriginalName:  "sample.png",
+			Extension:     "png",
+			Type:          resource.TypeImage,
+			Size:          1,
+			ContentType:   "image/png",
+			Hash:          "legacy",
+			Status:        resource.StatusActive,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateReq := httptest.NewRequest(http.MethodGet, "/api/v1/install/state", nil)
+	stateRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(stateRec, stateReq)
+	if stateRec.Code != http.StatusOK {
+		t.Fatalf("state status = %d, want %d; body: %s", stateRec.Code, http.StatusOK, stateRec.Body.String())
+	}
+	var state persist.InstallState
+	if err := json.NewDecoder(stateRec.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.Initialized {
+		t.Fatal("state initialized = false, want true when existing resource data is present")
+	}
+
+	setupReq := httptest.NewRequest(http.MethodPost, "/api/v1/install/setup", bytes.NewBufferString(`{
+		"siteName":"恶意初始化",
+		"defaultStorage":"local",
+		"adminUsername":"attacker",
+		"displayName":"Attacker",
+		"password":"secret123"
+	}`))
+	setupRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(setupRec, setupReq)
+	if setupRec.Code != http.StatusConflict {
+		t.Fatalf("setup status = %d, want %d; body: %s", setupRec.Code, http.StatusConflict, setupRec.Body.String())
 	}
 }
 

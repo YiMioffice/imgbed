@@ -101,6 +101,17 @@ type StorageConfig struct {
 	UpdatedAt       time.Time `json:"updatedAt"`
 }
 
+type DeliveryRoute struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description"`
+	PublicBaseURL string    `json:"publicBaseUrl"`
+	IsDefault     bool      `json:"isDefault"`
+	IsEnabled     bool      `json:"isEnabled"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
 type SiteSettings struct {
 	SiteName           string    `json:"siteName"`
 	ExternalBaseURL    string    `json:"externalBaseUrl"`
@@ -149,6 +160,9 @@ type DataStore interface {
 	StorageConfigs(ctx context.Context) ([]StorageConfig, error)
 	UpsertStorageConfig(ctx context.Context, cfg StorageConfig) (StorageConfig, error)
 	DefaultStorageConfig(ctx context.Context) (StorageConfig, error)
+	DeliveryRoutes(ctx context.Context) ([]DeliveryRoute, error)
+	UpsertDeliveryRoute(ctx context.Context, route DeliveryRoute) (DeliveryRoute, error)
+	DeleteDeliveryRoute(ctx context.Context, id string) error
 	SiteSettings(ctx context.Context) (SiteSettings, error)
 	UpdateSiteSettings(ctx context.Context, settings SiteSettings) (SiteSettings, error)
 	FeaturedResources(ctx context.Context, includeInactive bool) ([]FeaturedResource, error)
@@ -175,6 +189,7 @@ type dataFile struct {
 	Groups         []UserGroup               `json:"groups"`
 	Users          []auth.User               `json:"users"`
 	StorageConfigs []StorageConfig           `json:"storageConfigs"`
+	DeliveryRoutes []DeliveryRoute           `json:"deliveryRoutes"`
 	SiteSettings   SiteSettings              `json:"siteSettings"`
 	Featured       []FeaturedResource        `json:"featured"`
 	AppSettings    map[string]string         `json:"appSettings"`
@@ -254,7 +269,7 @@ func (s *Store) CreatePolicyGroup(_ context.Context, name, description string) (
 	return policy.Group{}, policy.ErrPolicyGroupInUse
 }
 
-func (s *Store) UpdatePolicyGroup(_ context.Context, groupID, name, description string) (policy.Group, error) {
+func (s *Store) UpdatePolicyGroup(_ context.Context, group policy.Group) (policy.Group, error) {
 	return policy.Group{}, policy.ErrPolicyGroupInUse
 }
 
@@ -655,6 +670,56 @@ func (s *Store) DefaultStorageConfig(_ context.Context) (StorageConfig, error) {
 	return StorageConfig{ID: "local", Type: "local", Name: "本机存储", IsDefault: true}, nil
 }
 
+func (s *Store) DeliveryRoutes(_ context.Context) ([]DeliveryRoute, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeDeliveryRoutes(s.data.DeliveryRoutes), nil
+}
+
+func (s *Store) UpsertDeliveryRoute(_ context.Context, route DeliveryRoute) (DeliveryRoute, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	route = normalizeDeliveryRoute(route)
+	if route.ID == "" {
+		route.ID = strings.ToLower(strings.ReplaceAll(route.Name, " ", "-"))
+		if route.ID == "" {
+			route.ID = "route"
+		}
+	}
+	if route.IsDefault {
+		for i := range s.data.DeliveryRoutes {
+			s.data.DeliveryRoutes[i].IsDefault = false
+		}
+	}
+	for i := range s.data.DeliveryRoutes {
+		if s.data.DeliveryRoutes[i].ID == route.ID {
+			route.CreatedAt = s.data.DeliveryRoutes[i].CreatedAt
+			route.UpdatedAt = time.Now()
+			s.data.DeliveryRoutes[i] = route
+			return route, s.saveLocked()
+		}
+	}
+	route.CreatedAt = time.Now()
+	route.UpdatedAt = route.CreatedAt
+	s.data.DeliveryRoutes = append(s.data.DeliveryRoutes, route)
+	return route, s.saveLocked()
+}
+
+func (s *Store) DeleteDeliveryRoute(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, route := range s.data.DeliveryRoutes {
+		if route.ID == id {
+			if route.IsDefault {
+				return errors.New("default delivery route cannot be deleted")
+			}
+			s.data.DeliveryRoutes = append(s.data.DeliveryRoutes[:i], s.data.DeliveryRoutes[i+1:]...)
+			return s.saveLocked()
+		}
+	}
+	return ErrNotFound
+}
+
 func (s *Store) SigningSecret(_ context.Context) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -800,6 +865,7 @@ func (s *Store) load(defaultRules []policy.Rule) error {
 	if s.data.AppSettings == nil {
 		s.data.AppSettings = map[string]string{}
 	}
+	s.data.DeliveryRoutes = normalizeDeliveryRoutes(s.data.DeliveryRoutes)
 	if len(s.data.Rules) == 0 {
 		s.data.Rules = append([]policy.Rule(nil), defaultRules...)
 		return s.saveLocked()
@@ -888,6 +954,53 @@ func normalizeUserGroup(group UserGroup) UserGroup {
 		group.ImageCompressionQuality = 80
 	}
 	return group
+}
+
+func normalizeDeliveryRoutes(routes []DeliveryRoute) []DeliveryRoute {
+	if len(routes) == 0 {
+		now := time.Now()
+		return []DeliveryRoute{{
+			ID:            "default",
+			Name:          "默认线路",
+			Description:   "使用站点外部访问地址或服务默认地址。",
+			PublicBaseURL: "",
+			IsDefault:     true,
+			IsEnabled:     true,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}}
+	}
+	next := slices.Clone(routes)
+	hasDefault := false
+	for i := range next {
+		next[i] = normalizeDeliveryRoute(next[i])
+		if next[i].IsDefault {
+			if hasDefault {
+				next[i].IsDefault = false
+			} else {
+				hasDefault = true
+			}
+		}
+	}
+	if !hasDefault {
+		next[0].IsDefault = true
+	}
+	return next
+}
+
+func normalizeDeliveryRoute(route DeliveryRoute) DeliveryRoute {
+	route.ID = strings.TrimSpace(route.ID)
+	route.Name = strings.TrimSpace(route.Name)
+	route.Description = strings.TrimSpace(route.Description)
+	route.PublicBaseURL = strings.TrimRight(strings.TrimSpace(route.PublicBaseURL), "/")
+	if route.Name == "" {
+		route.Name = route.ID
+	}
+	if route.ID == "" && route.Name == "" {
+		route.ID = "default"
+		route.Name = "默认线路"
+	}
+	return route
 }
 
 func dayBoundsUTC(now time.Time) (time.Time, time.Time) {
