@@ -1030,6 +1030,8 @@
     if (value === 'upload denied by policy') return '策略禁止上传';
     if (value === 'access denied by policy') return '策略禁止访问';
     if (value === 'login required by policy') return '策略要求先登录';
+    if (value === 'upload request exceeds server limit') return '上传请求超过后端允许的请求体上限';
+    if (value === 'upload request was interrupted before it completed') return '上传连接中途断开或超时，请检查反代超时、后端读取超时和网络稳定性';
     if (value.startsWith('file size exceeds policy limit')) return '文件大小超过策略上限';
     if (value.startsWith('file size exceeds user group limit')) return '文件大小超过用户组单文件上限';
     if (value === 'same IP daily upload limit exceeded') return '同一 IP 今日上传次数已达上限';

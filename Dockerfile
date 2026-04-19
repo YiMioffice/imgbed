@@ -19,6 +19,8 @@ RUN apk add --no-cache ca-certificates tzdata
 COPY --from=backend-build /out/machring /usr/local/bin/machring
 VOLUME ["/var/lib/machring"]
 ENV MACHRING_HTTP_ADDR=:8080
+ENV MACHRING_HTTP_READ_TIMEOUT=30m
+ENV MACHRING_HTTP_WRITE_TIMEOUT=30m
 ENV MACHRING_DATA_DIR=/var/lib/machring
 ENV MACHRING_DATABASE_PATH=/var/lib/machring/machring.db
 ENV MACHRING_UPLOAD_DIR=/var/lib/machring/uploads

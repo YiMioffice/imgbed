@@ -580,6 +580,7 @@ func (api *API) testPolicy(w http.ResponseWriter, r *http.Request) {
 type uploadError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Detail  string `json:"detail,omitempty"`
 }
 
 type uploadItemResponse struct {
@@ -766,8 +767,9 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": uploadError{Code: "invalid_multipart", Message: "invalid multipart request"},
+		status, uploadErr := multipartUploadError(err)
+		writeJSON(w, status, map[string]any{
+			"error": uploadErr,
 		})
 		return
 	}
@@ -2224,6 +2226,29 @@ func (api *API) shouldSerializeUploads(ctx context.Context, group string) bool {
 		return true
 	}
 	return groupConfig.TotalCapacityBytes > 0 || groupConfig.DailyUploadLimit > 0
+}
+
+func multipartUploadError(err error) (int, uploadError) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return http.StatusRequestEntityTooLarge, uploadError{
+			Code:    "request_too_large",
+			Message: "upload request exceeds server limit",
+			Detail:  err.Error(),
+		}
+	}
+
+	detail := err.Error()
+	normalized := strings.ToLower(detail)
+	message := "invalid multipart request"
+	if errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(normalized, "unexpected eof") || strings.Contains(normalized, "i/o timeout") {
+		message = "upload request was interrupted before it completed"
+	}
+	return http.StatusBadRequest, uploadError{
+		Code:    "invalid_multipart",
+		Message: message,
+		Detail:  detail,
+	}
 }
 
 func parseIntDefault(raw string, fallback int) int {

@@ -27,9 +27,9 @@ func main() {
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.New(application).Routes(),
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       cfg.HTTPReadTimeout,
 		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      10 * time.Minute,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
