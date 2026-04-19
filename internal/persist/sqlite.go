@@ -601,7 +601,7 @@ func (s *SQLiteStore) UserByID(ctx context.Context, id string) (auth.User, error
 func (s *SQLiteStore) UserGroups(ctx context.Context) ([]UserGroup, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			max_file_size_bytes, daily_upload_limit, daily_ip_upload_limit, allow_hotlink,
 			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		ORDER BY created_at ASC
@@ -628,9 +628,9 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO user_groups (
 			id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			max_file_size_bytes, daily_upload_limit, daily_ip_upload_limit, allow_hotlink,
 			image_compression_enabled, image_compression_quality, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name = excluded.name,
 			description = excluded.description,
@@ -638,6 +638,7 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 			default_monthly_traffic_bytes = excluded.default_monthly_traffic_bytes,
 			max_file_size_bytes = excluded.max_file_size_bytes,
 			daily_upload_limit = excluded.daily_upload_limit,
+			daily_ip_upload_limit = excluded.daily_ip_upload_limit,
 			allow_hotlink = excluded.allow_hotlink,
 			image_compression_enabled = excluded.image_compression_enabled,
 			image_compression_quality = excluded.image_compression_quality,
@@ -650,6 +651,7 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 		group.DefaultMonthlyTrafficBytes,
 		group.MaxFileSizeBytes,
 		group.DailyUploadLimit,
+		group.DailyIPUploadLimit,
 		boolInt(group.AllowHotlink),
 		boolInt(group.ImageCompressionEnabled),
 		group.ImageCompressionQuality,
@@ -662,7 +664,7 @@ func (s *SQLiteStore) UpdateUserGroup(ctx context.Context, group UserGroup) (Use
 
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			max_file_size_bytes, daily_upload_limit, daily_ip_upload_limit, allow_hotlink,
 			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		WHERE id = ?
@@ -677,7 +679,7 @@ func (s *SQLiteStore) UserUsage(ctx context.Context, userID string) (UserUsage, 
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, name, description, total_capacity_bytes, default_monthly_traffic_bytes,
-			max_file_size_bytes, daily_upload_limit, allow_hotlink,
+			max_file_size_bytes, daily_upload_limit, daily_ip_upload_limit, allow_hotlink,
 			image_compression_enabled, image_compression_quality, created_at, updated_at
 		FROM user_groups
 		WHERE id = ?
@@ -736,6 +738,19 @@ func (s *SQLiteStore) AnonymousUsage(ctx context.Context, groupID string) (int64
 		return 0, 0, err
 	}
 	return usedStorageBytes, dailyUploadCount, nil
+}
+
+func (s *SQLiteStore) AnonymousIPDailyUploadCount(ctx context.Context, groupID, uploadIP string) (int, error) {
+	var dailyUploadCount int
+	dayStart, dayEnd := utcDayBounds(time.Now())
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM resources
+		WHERE user_group = ? AND owner_user_id = '' AND upload_ip = ? AND created_at >= ? AND created_at < ?
+	`, groupID, uploadIP, formatTime(dayStart), formatTime(dayEnd)).Scan(&dailyUploadCount); err != nil {
+		return 0, err
+	}
+	return dailyUploadCount, nil
 }
 
 func (s *SQLiteStore) ListUsers(ctx context.Context) ([]auth.User, error) {
@@ -1622,6 +1637,7 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 			default_monthly_traffic_bytes INTEGER NOT NULL DEFAULT 0,
 			max_file_size_bytes INTEGER NOT NULL DEFAULT 0,
 			daily_upload_limit INTEGER NOT NULL DEFAULT 0,
+			daily_ip_upload_limit INTEGER NOT NULL DEFAULT 0,
 			allow_hotlink INTEGER NOT NULL DEFAULT 1,
 			image_compression_enabled INTEGER NOT NULL DEFAULT 1,
 			image_compression_quality INTEGER NOT NULL DEFAULT 50,
@@ -1823,6 +1839,18 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "allow_hotlink", `ALTER TABLE user_groups ADD COLUMN allow_hotlink INTEGER NOT NULL DEFAULT 1`); err != nil {
 		return err
 	}
+	hadDailyIPUploadLimit, err := sqliteColumnExists(ctx, s.db, "user_groups", "daily_ip_upload_limit")
+	if err != nil {
+		return err
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "daily_ip_upload_limit", `ALTER TABLE user_groups ADD COLUMN daily_ip_upload_limit INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if !hadDailyIPUploadLimit {
+		if _, err := s.db.ExecContext(ctx, `UPDATE user_groups SET daily_ip_upload_limit = 5 WHERE id = ?`, policy.GroupGuest); err != nil {
+			return err
+		}
+	}
 	if err := ensureSQLiteColumn(ctx, s.db, "user_groups", "image_compression_enabled", `ALTER TABLE user_groups ADD COLUMN image_compression_enabled INTEGER NOT NULL DEFAULT 1`); err != nil {
 		return err
 	}
@@ -1845,24 +1873,25 @@ func (s *SQLiteStore) seedUserGroups(ctx context.Context) error {
 
 func (s *SQLiteStore) seedUserGroupsTx(ctx context.Context, exec execContext, now time.Time) error {
 	groups := []struct {
-		ID          string
-		Name        string
-		Description string
+		ID                 string
+		Name               string
+		Description        string
+		DailyIPUploadLimit int
 	}{
-		{ID: policy.GroupGuest, Name: "游客", Description: "未登录访问者"},
+		{ID: policy.GroupGuest, Name: "游客", Description: "未登录访问者", DailyIPUploadLimit: 5},
 		{ID: policy.GroupUser, Name: "登录用户", Description: "普通登录用户"},
 		{ID: policy.GroupAdmin, Name: "管理员", Description: "系统管理员"},
 	}
 
 	for _, group := range groups {
 		if _, err := exec.ExecContext(ctx, `
-			INSERT INTO user_groups (id, name, description, allow_hotlink, image_compression_enabled, image_compression_quality, created_at, updated_at)
-			VALUES (?, ?, ?, 1, 1, 50, ?, ?)
+			INSERT INTO user_groups (id, name, description, daily_ip_upload_limit, allow_hotlink, image_compression_enabled, image_compression_quality, created_at, updated_at)
+			VALUES (?, ?, ?, ?, 1, 1, 50, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				name = excluded.name,
 				description = excluded.description,
 				updated_at = excluded.updated_at
-		`, group.ID, group.Name, group.Description, formatTime(now), formatTime(now)); err != nil {
+		`, group.ID, group.Name, group.Description, group.DailyIPUploadLimit, formatTime(now), formatTime(now)); err != nil {
 			return err
 		}
 	}
@@ -2068,9 +2097,21 @@ type execContext interface {
 }
 
 func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, alterSQL string) error {
-	rows, err := db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	exists, err := sqliteColumnExists(ctx, db, table, column)
 	if err != nil {
 		return err
+	}
+	if exists {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, alterSQL)
+	return err
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, err
 	}
 	defer rows.Close()
 
@@ -2082,17 +2123,16 @@ func ensureSQLiteColumn(ctx context.Context, db *sql.DB, table, column, alterSQL
 		var defaultValue sql.NullString
 		var pk int
 		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if strings.EqualFold(name, column) {
-			return nil
+			return true, nil
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return false, err
 	}
-	_, err = db.ExecContext(ctx, alterSQL)
-	return err
+	return false, nil
 }
 
 func (s *SQLiteStore) resourceMetadata(ctx context.Context, resourceID string) (resource.StoredMetadata, error) {
@@ -2333,6 +2373,7 @@ func scanUserGroup(row scanner) (UserGroup, error) {
 		&group.DefaultMonthlyTrafficBytes,
 		&group.MaxFileSizeBytes,
 		&group.DailyUploadLimit,
+		&group.DailyIPUploadLimit,
 		&allowHotlink,
 		&imageCompressionEnabled,
 		&group.ImageCompressionQuality,

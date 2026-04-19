@@ -948,6 +948,34 @@ func TestGuestQuotaRejectsUpload(t *testing.T) {
 	}
 }
 
+func TestGuestDailyIPUploadLimitRejectsSameIP(t *testing.T) {
+	api := testAPI(t, true)
+	guestGroup := lookupGroup(t, api, policy.GroupGuest)
+	guestGroup.DailyIPUploadLimit = 1
+	if _, err := api.app.Data.UpdateUserGroup(context.Background(), guestGroup); err != nil {
+		t.Fatal(err)
+	}
+
+	firstRec := uploadTestFile(t, api, "sample.png", tinyPNG, "", "")
+	if firstRec.Code != http.StatusCreated {
+		t.Fatalf("first upload status = %d, want %d; body: %s", firstRec.Code, http.StatusCreated, firstRec.Body.String())
+	}
+
+	secondRec := uploadTestFile(t, api, "sample2.png", tinyPNG, "", "")
+	if secondRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second upload status = %d, want %d; body: %s", secondRec.Code, http.StatusTooManyRequests, secondRec.Body.String())
+	}
+	var payload struct {
+		Error uploadError `json:"error"`
+	}
+	if err := json.NewDecoder(secondRec.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Error.Code != "daily_ip_upload_limit_exceeded" {
+		t.Fatalf("error code = %q, want %q", payload.Error.Code, "daily_ip_upload_limit_exceeded")
+	}
+}
+
 func TestUploadRateLimit(t *testing.T) {
 	api := testAPI(t, true)
 	api.uploadLimiter = newFixedWindowRateLimiter(1, time.Hour)

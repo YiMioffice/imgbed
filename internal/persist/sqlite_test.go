@@ -162,12 +162,16 @@ func TestSQLiteStorePersistsUserGroupImageCompression(t *testing.T) {
 	if guest.ID == "" {
 		t.Fatal("guest group not found")
 	}
+	if guest.DailyIPUploadLimit != 5 {
+		t.Fatalf("default daily ip upload limit = %d, want 5", guest.DailyIPUploadLimit)
+	}
 	if !guest.ImageCompressionEnabled || guest.ImageCompressionQuality != 50 {
 		t.Fatalf("default compression = %v/%d, want true/50", guest.ImageCompressionEnabled, guest.ImageCompressionQuality)
 	}
 
 	guest.ImageCompressionEnabled = false
 	guest.ImageCompressionQuality = 80
+	guest.DailyIPUploadLimit = 0
 	if _, err := store.UpdateUserGroup(ctx, guest); err != nil {
 		t.Fatal(err)
 	}
@@ -185,6 +189,9 @@ func TestSQLiteStorePersistsUserGroupImageCompression(t *testing.T) {
 	}
 	for _, group := range groups {
 		if group.ID == policy.GroupGuest {
+			if group.DailyIPUploadLimit != 0 {
+				t.Fatalf("persisted daily ip upload limit = %d, want 0", group.DailyIPUploadLimit)
+			}
 			if group.ImageCompressionEnabled || group.ImageCompressionQuality != 80 {
 				t.Fatalf("persisted compression = %v/%d, want false/80", group.ImageCompressionEnabled, group.ImageCompressionQuality)
 			}

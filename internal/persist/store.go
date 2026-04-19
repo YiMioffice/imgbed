@@ -50,6 +50,7 @@ type UserGroup struct {
 	DefaultMonthlyTrafficBytes int64     `json:"defaultMonthlyTrafficBytes"`
 	MaxFileSizeBytes           int64     `json:"maxFileSizeBytes"`
 	DailyUploadLimit           int       `json:"dailyUploadLimit"`
+	DailyIPUploadLimit         int       `json:"dailyIpUploadLimit"`
 	AllowHotlink               bool      `json:"allowHotlink"`
 	ImageCompressionEnabled    bool      `json:"imageCompressionEnabled"`
 	ImageCompressionQuality    int       `json:"imageCompressionQuality"`
@@ -140,6 +141,7 @@ type DataStore interface {
 	UpdateUserGroup(ctx context.Context, group UserGroup) (UserGroup, error)
 	UserUsage(ctx context.Context, userID string) (UserUsage, error)
 	AnonymousUsage(ctx context.Context, groupID string) (int64, int, error)
+	AnonymousIPDailyUploadCount(ctx context.Context, groupID, uploadIP string) (int, error)
 	ListUsers(ctx context.Context) ([]auth.User, error)
 	CreateUser(ctx context.Context, params CreateUserParams) (auth.User, error)
 	UpdateUser(ctx context.Context, params UpdateUserParams) (auth.User, error)
@@ -544,6 +546,24 @@ func (s *Store) AnonymousUsage(_ context.Context, groupID string) (int64, int, e
 		}
 	}
 	return usedStorageBytes, dailyUploadCount, nil
+}
+
+func (s *Store) AnonymousIPDailyUploadCount(_ context.Context, groupID, uploadIP string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	dailyUploadCount := 0
+	dayStart, dayEnd := dayBoundsUTC(time.Now())
+	for _, record := range s.data.Resources {
+		if record.UserGroup != groupID || record.OwnerUserID != "" || record.UploadIP != uploadIP {
+			continue
+		}
+		createdAt := record.CreatedAt.UTC()
+		if !createdAt.Before(dayStart) && createdAt.Before(dayEnd) {
+			dailyUploadCount++
+		}
+	}
+	return dailyUploadCount, nil
 }
 
 func (s *Store) ListUsers(_ context.Context) ([]auth.User, error) {

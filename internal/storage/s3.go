@@ -185,7 +185,37 @@ func (s *S3) HealthCheck(ctx context.Context) error {
 		return err
 	}
 	defer drainAndClose(resp.Body)
-	return requireStatus(resp, http.StatusOK, http.StatusNoContent)
+	if err := requireStatus(resp, http.StatusOK, http.StatusNoContent); err == nil {
+		return nil
+	}
+	return s.objectProbe(ctx)
+}
+
+func (s *S3) objectProbe(ctx context.Context) error {
+	key := ".machring-healthcheck/" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	putReq, err := s.newObjectRequest(ctx, http.MethodPut, key, strings.NewReader(""), emptyPayloadSHA256)
+	if err != nil {
+		return err
+	}
+	putReq.ContentLength = 0
+	putResp, err := s.client.Do(putReq)
+	if err != nil {
+		return err
+	}
+	if err := requireStatus(putResp, http.StatusOK, http.StatusCreated, http.StatusNoContent); err != nil {
+		drainAndClose(putResp.Body)
+		return err
+	}
+	drainAndClose(putResp.Body)
+
+	if exists, err := s.Exists(ctx, key); err != nil {
+		_ = s.Delete(ctx, key)
+		return err
+	} else if !exists {
+		_ = s.Delete(ctx, key)
+		return errors.New("s3 health probe object was not visible after upload")
+	}
+	return s.Delete(ctx, key)
 }
 
 func (s *S3) newObjectRequest(ctx context.Context, method, key string, body io.Reader, payloadHash string) (*http.Request, error) {

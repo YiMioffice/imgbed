@@ -594,6 +594,7 @@ type userGroupRequest struct {
 	DefaultMonthlyTrafficBytes int64  `json:"defaultMonthlyTrafficBytes"`
 	MaxFileSizeBytes           int64  `json:"maxFileSizeBytes"`
 	DailyUploadLimit           int    `json:"dailyUploadLimit"`
+	DailyIPUploadLimit         *int   `json:"dailyIpUploadLimit"`
 	AllowHotlink               bool   `json:"allowHotlink"`
 	ImageCompressionEnabled    *bool  `json:"imageCompressionEnabled"`
 	ImageCompressionQuality    int    `json:"imageCompressionQuality"`
@@ -896,7 +897,7 @@ func (api *API) updateUserGroup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorPayload("invalid user group payload", err))
 		return
 	}
-	if req.TotalCapacityBytes < 0 || req.DefaultMonthlyTrafficBytes < 0 || req.MaxFileSizeBytes < 0 || req.DailyUploadLimit < 0 {
+	if req.TotalCapacityBytes < 0 || req.DefaultMonthlyTrafficBytes < 0 || req.MaxFileSizeBytes < 0 || req.DailyUploadLimit < 0 || (req.DailyIPUploadLimit != nil && *req.DailyIPUploadLimit < 0) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "group limits must be greater than or equal to 0"})
 		return
 	}
@@ -921,6 +922,10 @@ func (api *API) updateUserGroup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "image compression quality must be between 50 and 80"})
 		return
 	}
+	dailyIPUploadLimit := existing.DailyIPUploadLimit
+	if req.DailyIPUploadLimit != nil {
+		dailyIPUploadLimit = *req.DailyIPUploadLimit
+	}
 	group := persist.UserGroup{
 		ID:                         existing.ID,
 		Name:                       firstNonEmpty(strings.TrimSpace(req.Name), existing.Name),
@@ -929,6 +934,7 @@ func (api *API) updateUserGroup(w http.ResponseWriter, r *http.Request) {
 		DefaultMonthlyTrafficBytes: req.DefaultMonthlyTrafficBytes,
 		MaxFileSizeBytes:           req.MaxFileSizeBytes,
 		DailyUploadLimit:           req.DailyUploadLimit,
+		DailyIPUploadLimit:         dailyIPUploadLimit,
 		AllowHotlink:               req.AllowHotlink,
 		ImageCompressionEnabled:    imageCompressionEnabled,
 		ImageCompressionQuality:    imageCompressionQuality,
@@ -1778,7 +1784,7 @@ func (api *API) handleUploadFile(ctx context.Context, actor *auth.User, group st
 			item.Metadata = meta
 		}
 	}
-	if status, quotaErr := api.checkUploadQuota(ctx, actor, groupConfig, meta.Size); quotaErr != nil {
+	if status, quotaErr := api.checkUploadQuota(ctx, actor, groupConfig, meta.Size, uploadIP); quotaErr != nil {
 		item.Status = status
 		item.Error = quotaErr
 		return item
@@ -2348,7 +2354,7 @@ func sanitizeStorageConfig(cfg persist.StorageConfig) persist.StorageConfig {
 	return cfg
 }
 
-func (api *API) checkUploadQuota(ctx context.Context, actor *auth.User, group persist.UserGroup, size int64) (int, *uploadError) {
+func (api *API) checkUploadQuota(ctx context.Context, actor *auth.User, group persist.UserGroup, size int64, uploadIP string) (int, *uploadError) {
 	if group.MaxFileSizeBytes > 0 && size > group.MaxFileSizeBytes {
 		return http.StatusRequestEntityTooLarge, &uploadError{
 			Code:    "group_file_too_large",
@@ -2373,6 +2379,21 @@ func (api *API) checkUploadQuota(ctx context.Context, actor *auth.User, group pe
 			return http.StatusTooManyRequests, &uploadError{
 				Code:    "daily_upload_limit_exceeded",
 				Message: "daily upload limit exceeded",
+			}
+		}
+		if group.DailyIPUploadLimit > 0 && strings.TrimSpace(uploadIP) != "" {
+			dailyIPUploadCount, err := api.app.Data.AnonymousIPDailyUploadCount(ctx, group.ID, uploadIP)
+			if err != nil {
+				return http.StatusInternalServerError, &uploadError{
+					Code:    "usage_lookup_failed",
+					Message: "failed to resolve ip usage",
+				}
+			}
+			if dailyIPUploadCount+1 > group.DailyIPUploadLimit {
+				return http.StatusTooManyRequests, &uploadError{
+					Code:    "daily_ip_upload_limit_exceeded",
+					Message: "same IP daily upload limit exceeded",
+				}
 			}
 		}
 		return 0, nil

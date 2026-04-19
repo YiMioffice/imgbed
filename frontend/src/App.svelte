@@ -32,7 +32,7 @@
   type UploadItemResponse = { success: boolean; status: number; filename: string; metadata: { filename: string; extension: string; type: string; contentType: string; size: number }; resource?: ResourceRecord; links?: ResourceLinks; decision?: PolicyDecision; compression?: { applied: boolean; originalBytes: number; compressedBytes: number; quality: number; ratio: number }; error?: { code: string; message: string } };
   type UploadQueueItem = { name: string; size: number; progress: number; status: 'pending' | 'uploading' | 'success' | 'error'; resource?: ResourceRecord; links?: ResourceLinks; message?: string; errorCode?: string };
   type OverviewStats = { totalResources: number; activeResources: number; totalStorageBytes: number; totalTrafficBytes: number; todayUploads: number; recentTraffic: Array<{ label: string; bytes: number }> };
-  type UserGroup = { id: string; name: string; description: string; totalCapacityBytes: number; defaultMonthlyTrafficBytes: number; maxFileSizeBytes: number; dailyUploadLimit: number; allowHotlink: boolean; imageCompressionEnabled: boolean; imageCompressionQuality: number; createdAt: string; updatedAt: string };
+  type UserGroup = { id: string; name: string; description: string; totalCapacityBytes: number; defaultMonthlyTrafficBytes: number; maxFileSizeBytes: number; dailyUploadLimit: number; dailyIpUploadLimit: number; allowHotlink: boolean; imageCompressionEnabled: boolean; imageCompressionQuality: number; createdAt: string; updatedAt: string };
   type AccountUsage = { user?: AuthUser | null; group: UserGroup; usedStorageBytes: number; monthlyTrafficBytes: number; dailyUploadCount: number };
   type ManagedUser = AuthUser;
   type StorageConfig = { id: string; type: string; name: string; endpoint: string; region: string; bucket: string; accessKeyId: string; secretAccessKey?: string; username?: string; password?: string; publicBaseUrl: string; basePath: string; usePathStyle: boolean; isDefault: boolean; createdAt?: string; updatedAt?: string };
@@ -167,14 +167,18 @@
   let managedUsers: ManagedUser[] = [];
   let userAdminError = '';
   let userAdminMessage = '';
+  let isCreatingUser = false;
+  let savingManagedUserId = '';
   let createUserForm = { username: '', displayName: '', password: '', groupId: 'user', status: 'active' };
   let storageConfigs: StorageConfig[] = [];
   let storageError = '';
   let storageMessage = '';
   let savingStorageId = '';
+  let checkingStorageId = '';
   let storageHealthResult = '';
   let siteSettingsError = '';
   let siteSettingsMessage = '';
+  let isSavingSiteSettings = false;
   let featuredError = '';
   let featuredMessage = '';
   let routeLoadToken = 0;
@@ -428,6 +432,7 @@
   async function saveSiteSettings() {
     siteSettingsError = '';
     siteSettingsMessage = '';
+    isSavingSiteSettings = true;
     try {
       const res = await fetch('/api/v1/site-settings', {
         method: 'PUT',
@@ -450,6 +455,8 @@
       await loadInstallState(true);
     } catch (error) {
       siteSettingsError = error instanceof Error ? error.message : '保存站点设置失败';
+    } finally {
+      isSavingSiteSettings = false;
     }
   }
 
@@ -614,7 +621,7 @@
   async function savePolicies() { isSavingPolicies = true; policySaveError = ''; policySaveMessage = ''; matrixError = ''; try { const parsed = collectMatrixRules(); const errors = validateMatrixRules(parsed); if (errors.length > 0) return void (matrixError = errors[0]); const res = await fetch(`/api/v1/policies?groupId=${encodeURIComponent(selectedPolicyGroupId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rules: parsed }) }); const payload = await res.json(); if (!res.ok) return void (policySaveError = payload.validationErrors?.[0]?.message ?? payload.error ?? '保存策略失败'); rulesJson = JSON.stringify(payload.rules ?? [], null, 2); syncMatrixFromRules(payload.rules ?? []); policyCacheTimestamps.delete(selectedPolicyGroupId); cacheTimestamps.policyGroups = 0; policySaveMessage = '策略已保存。'; await loadPolicyGroups(true); } catch (error) { policySaveError = error instanceof Error ? error.message : '保存策略失败'; } finally { isSavingPolicies = false; } }
   async function runPolicyTest() { isTestingPolicy = true; policyError = ''; policyResult = null; try { const res = await fetch('/api/v1/policies/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...policyForm, size: unitToBytes(String(policyForm.size), megabyte) }) }); const payload = await res.json(); if (!res.ok) return void (policyError = res.status === 401 ? '请先登录管理员账号' : (payload.error ?? '策略测试失败')); policyResult = payload; } catch (error) { policyError = error instanceof Error ? error.message : '策略测试失败'; } finally { isTestingPolicy = false; } }
   async function loadUserGroups(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.userGroups, cacheTTL.userGroups)) return; if (!silent) { userGroupError = ''; userGroupMessage = ''; } return runDeduped('userGroups', async () => { try { const res = await fetch('/api/v1/user-groups'); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '加载用户组失败'); userGroups = payload.groups ?? []; cacheTimestamps.userGroups = Date.now(); } catch (error) { if (!silent) userGroupError = error instanceof Error ? error.message : '加载用户组失败'; } }); }
-  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; savingUserGroupId = group.id; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, allowHotlink: group.allowHotlink, imageCompressionEnabled: !!group.imageCompressionEnabled, imageCompressionQuality: clampCompressionQuality(group.imageCompressionQuality) }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } finally { savingUserGroupId = ''; } }
+  async function saveUserGroup(group: UserGroup) { userGroupError = ''; userGroupMessage = ''; savingUserGroupId = group.id; try { const res = await fetch(`/api/v1/user-groups/${encodeURIComponent(group.id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: group.name, description: group.description, totalCapacityBytes: Number(group.totalCapacityBytes) || 0, defaultMonthlyTrafficBytes: Number(group.defaultMonthlyTrafficBytes) || 0, maxFileSizeBytes: Number(group.maxFileSizeBytes) || 0, dailyUploadLimit: Number(group.dailyUploadLimit) || 0, dailyIpUploadLimit: Number(group.dailyIpUploadLimit) || 0, allowHotlink: group.allowHotlink, imageCompressionEnabled: !!group.imageCompressionEnabled, imageCompressionQuality: clampCompressionQuality(group.imageCompressionQuality) }) }); const payload = await res.json(); if (!res.ok) return void (userGroupError = payload.error ?? '保存用户组失败'); userGroupMessage = `${payload.group?.name ?? group.name} 已保存。`; invalidateCache('userGroups', 'accountUsage'); await loadUserGroups(true, true); if (accountUsage?.group?.id === group.id) await loadAccountUsage(true); } catch (error) { userGroupError = error instanceof Error ? error.message : '保存用户组失败'; } finally { savingUserGroupId = ''; } }
   async function loadUsers(silent = false, force = false) { if (!force && isFresh(cacheTimestamps.users, cacheTTL.users)) return; if (!silent) { userAdminError = ''; userAdminMessage = ''; } return runDeduped('users', async () => { try { const res = await fetch('/api/v1/users'); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '加载用户失败'); managedUsers = payload.users ?? []; cacheTimestamps.users = Date.now(); } catch (error) { if (!silent) userAdminError = error instanceof Error ? error.message : '加载用户失败'; } }); }
   async function loadUserAdminData() { await loadUserGroups(true); await loadUsers(); }
   async function loadStorageConfigs(force = false) {
@@ -666,9 +673,13 @@
       });
       const payload = await res.json();
       if (!res.ok) return void (storageError = payload.error ?? '保存存储配置失败');
-      storageMessage = `${payload.config?.name ?? config.name} 已保存。`;
+      const savedConfig = ensureStorageConfig(payload.config ?? config, config.type);
+      storageMessage = `${savedConfig.name || config.name} 已保存${savedConfig.isDefault ? '，已设为默认上传存储' : ''}。`;
       invalidateCache('storageConfigs');
       await loadStorageConfigs(true);
+      if (savedConfig.type !== 'local') {
+        await runStorageHealthCheck({ ...config, ...savedConfig, secretAccessKey: config.secretAccessKey, password: config.password });
+      }
     } catch (error) {
       storageError = error instanceof Error ? error.message : '保存存储配置失败';
     } finally {
@@ -677,7 +688,8 @@
   }
   async function runStorageHealthCheck(config: StorageConfig) {
     storageError = '';
-    storageHealthResult = '';
+    storageHealthResult = `${config.name} 正在健康检查。`;
+    checkingStorageId = config.id;
     try {
       const res = await fetch('/api/v1/storage-configs/health-check', {
         method: 'POST',
@@ -700,14 +712,17 @@
         })
       });
       const payload = await res.json();
-      if (!res.ok) return void (storageError = payload.error ?? payload.detail ?? '存储健康检查失败');
+      if (!res.ok) { storageHealthResult = ''; return void (storageError = payload.error ?? payload.detail ?? '存储健康检查失败'); }
       storageHealthResult = `${config.name} 健康检查通过。`;
     } catch (error) {
+      storageHealthResult = '';
       storageError = error instanceof Error ? error.message : '存储健康检查失败';
+    } finally {
+      checkingStorageId = '';
     }
   }
-  async function createManagedUser() { userAdminError = ''; userAdminMessage = ''; if (!createUserForm.username.trim() || !createUserForm.displayName.trim() || createUserForm.password.length < 8) return void (userAdminError = '请填写账号、昵称和至少 8 位密码。'); try { const res = await fetch('/api/v1/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(createUserForm) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '创建用户失败'); createUserForm = { username: '', displayName: '', password: '', groupId: 'user', status: 'active' }; userAdminMessage = '用户已创建。'; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '创建用户失败'; } }
-  async function saveManagedUser(user: ManagedUser) { userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ displayName: user.displayName, groupId: user.groupId, status: user.status }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '保存用户失败'); userAdminMessage = `${user.displayName} 已保存。`; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '保存用户失败'; } }
+  async function createManagedUser() { userAdminError = ''; userAdminMessage = ''; if (!createUserForm.username.trim() || !createUserForm.displayName.trim() || createUserForm.password.length < 8) return void (userAdminError = '请填写账号、昵称和至少 8 位密码。'); isCreatingUser = true; try { const res = await fetch('/api/v1/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(createUserForm) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '创建用户失败'); createUserForm = { username: '', displayName: '', password: '', groupId: 'user', status: 'active' }; userAdminMessage = '用户已创建。'; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '创建用户失败'; } finally { isCreatingUser = false; } }
+  async function saveManagedUser(user: ManagedUser) { userAdminError = ''; userAdminMessage = ''; savingManagedUserId = user.id; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ displayName: user.displayName, groupId: user.groupId, status: user.status }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '保存用户失败'); userAdminMessage = `${user.displayName} 已保存。`; invalidateCache('users'); await loadUsers(true, true); } catch (error) { userAdminError = error instanceof Error ? error.message : '保存用户失败'; } finally { savingManagedUserId = ''; } }
   async function toggleUserBan(user: ManagedUser) { const nextStatus = user.status === 'banned' ? 'active' : 'banned'; if (!window.confirm(`${nextStatus === 'banned' ? '确认封禁' : '确认解封'} ${user.displayName} 吗？`)) return; await saveManagedUser({ ...user, status: nextStatus }); }
   async function resetManagedUserPassword(user: ManagedUser) { const password = window.prompt(`为 ${user.displayName} 输入新密码`, ''); if (!password) return; if (password.length < 8) return void (userAdminError = '新密码至少需要 8 位。'); if (!window.confirm(`确认重置 ${user.displayName} 的密码吗？`)) return; userAdminError = ''; userAdminMessage = ''; try { const res = await fetch(`/api/v1/users/${encodeURIComponent(user.id)}/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }); const payload = await res.json(); if (!res.ok) return void (userAdminError = payload.error ?? '重置密码失败'); userAdminMessage = `${user.displayName} 的密码已重置。`; } catch (error) { userAdminError = error instanceof Error ? error.message : '重置密码失败'; } }
 
@@ -903,6 +918,7 @@
     if (value === 'access denied by policy') return '策略禁止访问';
     if (value === 'login required by policy') return '策略要求先登录';
     if (value.startsWith('file size exceeds policy limit')) return '文件大小超过策略上限';
+    if (value === 'same IP daily upload limit exceeded') return '同一 IP 今日上传次数已达上限';
     if (value.startsWith('no policy rule matched')) return '没有匹配的策略规则';
     if (value.startsWith('unsupported policy action')) return '不支持的策略动作';
     return value;
@@ -919,7 +935,7 @@
   function securityHint(record: ResourceRecord) { if (record.isPrivate) return '私有资源默认拒绝匿名直链访问，可使用签名链接按时效开放。'; if (record.type === 'image') return '图片资源可直接预览。'; if (record.type === 'video') return '视频资源可在详情页内直接预览。'; if (record.type === 'script' || record.type === 'executable') return '脚本和可执行资源会强制下载，避免浏览器直接执行。'; return '非图片资源展示类型、大小、下载策略和安全提示。'; }
   function isFeaturedResource(resourceId: string) { return featuredResources.some((item) => item.resource.id === resourceId); }
   function homeFeaturedResources() { return featuredResources.slice(0, 4); }
-  function quotaHint(group?: UserGroup | null) { if (!group) return '当前没有用户组配额信息。'; const parts: string[] = []; if (group.maxFileSizeBytes > 0) parts.push(`单文件 ${formatBytes(group.maxFileSizeBytes)}`); if (group.totalCapacityBytes > 0) parts.push(`总容量 ${formatBytes(group.totalCapacityBytes)}`); if (group.dailyUploadLimit > 0) parts.push(`每日 ${group.dailyUploadLimit} 次`); if (group.defaultMonthlyTrafficBytes > 0) parts.push(`默认月流量 ${formatBytes(group.defaultMonthlyTrafficBytes)}`); return parts.length > 0 ? parts.join(' · ') : '当前用户组未设置额外配额。'; }
+  function quotaHint(group?: UserGroup | null) { if (!group) return '当前没有用户组配额信息。'; const parts: string[] = []; if (group.maxFileSizeBytes > 0) parts.push(`单文件 ${formatBytes(group.maxFileSizeBytes)}`); if (group.totalCapacityBytes > 0) parts.push(`总容量 ${formatBytes(group.totalCapacityBytes)}`); if (group.dailyUploadLimit > 0) parts.push(`每日 ${group.dailyUploadLimit} 次`); if (group.dailyIpUploadLimit > 0) parts.push(`同 IP 每日 ${group.dailyIpUploadLimit} 次`); if (group.defaultMonthlyTrafficBytes > 0) parts.push(`默认月流量 ${formatBytes(group.defaultMonthlyTrafficBytes)}`); return parts.length > 0 ? parts.join(' · ') : '当前用户组未设置额外配额。'; }
   function findStorageConfig(configs: StorageConfig[], id: string, type: string) { return configs.find((config) => config.id === id) ?? configs.find((config) => config.type === type); }
   function ensureStorageConfig(config: Partial<StorageConfig>, type: string): StorageConfig {
     return {
@@ -1319,7 +1335,9 @@
                 <label>默认月流量<input bind:value={group.defaultMonthlyTrafficBytes} type="number" min="0" /></label>
                 <label>单文件限制<input bind:value={group.maxFileSizeBytes} type="number" min="0" /></label>
                 <label>每日上传次数<input bind:value={group.dailyUploadLimit} type="number" min="0" /></label>
+                <label>同 IP 每日上传<input bind:value={group.dailyIpUploadLimit} type="number" min="0" /></label>
               </div>
+              <p class="muted-copy">同 IP 每日上传用于防盗刷，0 表示不限制；游客默认 5 次。</p>
               <label class="toggle-row"><span>允许匿名外链</span><input bind:checked={group.allowHotlink} type="checkbox" /></label>
               <div class="resource-actions"><button class="button primary compact" type="button" on:click={() => saveUserGroup(group)} disabled={savingUserGroupId === group.id}>{savingUserGroupId === group.id ? '保存中' : '保存用户组'}</button></div>
             </article>
@@ -1334,7 +1352,7 @@
           <label>初始密码<input bind:value={createUserForm.password} type="password" /></label>
           <label>用户组<select bind:value={createUserForm.groupId}>{#each userGroups as group}<option value={group.id}>{group.name}</option>{/each}</select></label>
           <label>状态<select bind:value={createUserForm.status}><option value="active">正常</option><option value="disabled">停用</option><option value="banned">封禁</option></select></label>
-          <button class="button primary filter-submit" type="submit">创建用户</button>
+          <button class="button primary filter-submit" type="submit" disabled={isCreatingUser}>{isCreatingUser ? '创建中' : '创建用户'}</button>
         </form>
         {#if userAdminError}<p class="form-error">{userAdminError}</p>{:else if userAdminMessage}<p class="form-success">{userAdminMessage}</p>{/if}
         <div class="resource-list">
@@ -1350,7 +1368,7 @@
                 <label>状态<select bind:value={user.status}><option value="active">正常</option><option value="disabled">停用</option><option value="banned">封禁</option></select></label>
               </div>
               <div class="resource-actions">
-                <button class="button primary compact" type="button" on:click={() => saveManagedUser(user)}>保存</button>
+                <button class="button primary compact" type="button" on:click={() => saveManagedUser(user)} disabled={savingManagedUserId === user.id}>{savingManagedUserId === user.id ? '保存中' : '保存'}</button>
                 <button class="button secondary compact" type="button" on:click={() => toggleUserBan(user)}>{user.status === 'banned' ? '解封' : '封禁'}</button>
                 <button class="button ghost compact" type="button" on:click={() => resetManagedUserPassword(user)}>重置密码</button>
               </div>
@@ -1391,7 +1409,7 @@
               <label class="toggle-row"><span>设为默认上传存储</span><input bind:checked={config.isDefault} type="checkbox" on:change={() => storageConfigs = storageConfigs.map((item) => ({ ...item, isDefault: item.id === config.id }))} /></label>
               <div class="resource-actions">
                 <button class="button primary compact" type="button" on:click={() => saveStorageConfig(config)} disabled={savingStorageId === config.id}>{savingStorageId === config.id ? '保存中' : '保存配置'}</button>
-                <button class="button secondary compact" type="button" on:click={() => runStorageHealthCheck(config)}>健康检查</button>
+                <button class="button secondary compact" type="button" on:click={() => runStorageHealthCheck(config)} disabled={checkingStorageId === config.id}>{checkingStorageId === config.id ? '检查中' : '健康检查'}</button>
               </div>
             </article>
           {/each}
@@ -1412,7 +1430,7 @@
           </div>
           {#if siteSettingsError}<p class="form-error">{siteSettingsError}</p>{:else if siteSettingsMessage}<p class="form-success">{siteSettingsMessage}</p>{/if}
           <div class="resource-actions">
-            <button class="button primary compact" type="button" on:click={saveSiteSettings}>保存站点设置</button>
+            <button class="button primary compact" type="button" on:click={saveSiteSettings} disabled={isSavingSiteSettings}>{isSavingSiteSettings ? '保存中' : '保存站点设置'}</button>
           </div>
         </article>
       {:else if isCompressionPage}
