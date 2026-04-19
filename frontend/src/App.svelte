@@ -588,7 +588,7 @@
       };
       xhr.onload = () => {
         const payload = parseUploadResponse(xhr);
-        if (xhr.status >= 200 && xhr.status < 300) return resolve(payload);
+        if ((xhr.status >= 200 && xhr.status < 300) || Array.isArray(payload?.items)) return resolve(payload);
         reject(new Error(uploadHTTPErrorMessage(xhr.status, payload)));
       };
       xhr.onerror = () => reject(new Error('上传请求失败'));
@@ -610,13 +610,18 @@
   }
 
   function uploadHTTPErrorMessage(status: number, payload: any) {
-    const message = payload?.error?.message || payload?.error;
+    const message = payload?.error?.message || payload?.error || firstUploadItemError(payload);
     if (message) return translateSystemMessage(message);
     if (status === 413) return '上传体积超过网关或反向代理限制，请调高 client_max_body_size / 平台上传限制后重试。';
     if (status === 429) return '上传请求过于频繁，请稍后重试。';
     if (status >= 500) return '服务器处理上传失败，请检查后端或存储服务状态。';
     if (status > 0) return `上传失败：HTTP ${status}`;
     return '上传请求失败';
+  }
+
+  function firstUploadItemError(payload: any) {
+    const item = Array.isArray(payload?.items) ? payload.items.find((entry: UploadItemResponse) => !entry.success) : null;
+    return item?.error?.message || item?.decision?.reason || '';
   }
 
   function estimateItemProgress(files: File[], index: number, ratio: number) {
@@ -1026,6 +1031,7 @@
     if (value === 'access denied by policy') return '策略禁止访问';
     if (value === 'login required by policy') return '策略要求先登录';
     if (value.startsWith('file size exceeds policy limit')) return '文件大小超过策略上限';
+    if (value.startsWith('file size exceeds user group limit')) return '文件大小超过用户组单文件上限';
     if (value === 'same IP daily upload limit exceeded') return '同一 IP 今日上传次数已达上限';
     if (value.startsWith('no policy rule matched')) return '没有匹配的策略规则';
     if (value.startsWith('unsupported policy action')) return '不支持的策略动作';
