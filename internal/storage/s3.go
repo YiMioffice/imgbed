@@ -226,6 +226,94 @@ func (s *S3) RedirectURL(ctx context.Context, key string, options RedirectOption
 	return targetURL.String(), nil
 }
 
+func (s *S3) DirectUploadURL(ctx context.Context, key string, options DirectUploadOptions) (DirectUploadTarget, error) {
+	if err := ctx.Err(); err != nil {
+		return DirectUploadTarget{}, err
+	}
+	method := strings.ToUpper(strings.TrimSpace(options.Method))
+	if method == "" {
+		method = http.MethodPut
+	}
+	if method != http.MethodPut {
+		return DirectUploadTarget{}, errors.New("s3 direct upload only supports PUT")
+	}
+	contentType := strings.TrimSpace(options.ContentType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	payloadHash := strings.ToLower(strings.TrimSpace(options.PayloadSHA256))
+	if len(payloadHash) != 64 {
+		return DirectUploadTarget{}, errors.New("payload sha256 is required")
+	}
+	if _, err := hex.DecodeString(payloadHash); err != nil {
+		return DirectUploadTarget{}, errors.New("payload sha256 is invalid")
+	}
+	expires := options.Expires
+	if expires <= 0 {
+		expires = 15 * time.Minute
+	}
+	if expires > 7*24*time.Hour {
+		expires = 7 * 24 * time.Hour
+	}
+
+	targetURL := s.objectURL(JoinBasePath(s.cfg.BasePath, key))
+	now := time.Now().UTC()
+	shortDate := now.Format("20060102")
+	scope := shortDate + "/" + s.cfg.Region + "/s3/aws4_request"
+	headers := map[string]string{
+		"content-type":         contentType,
+		"host":                 targetURL.Host,
+		"x-amz-content-sha256": payloadHash,
+	}
+	signedHeaders := make([]string, 0, len(headers))
+	for name := range headers {
+		signedHeaders = append(signedHeaders, name)
+	}
+	sort.Strings(signedHeaders)
+
+	query := targetURL.Query()
+	query.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	query.Set("X-Amz-Credential", s.cfg.AccessKeyID+"/"+scope)
+	query.Set("X-Amz-Date", now.Format("20060102T150405Z"))
+	query.Set("X-Amz-Expires", strconv.FormatInt(int64(expires/time.Second), 10))
+	query.Set("X-Amz-SignedHeaders", strings.Join(signedHeaders, ";"))
+	targetURL.RawQuery = query.Encode()
+
+	canonicalHeaderBuilder := strings.Builder{}
+	for _, name := range signedHeaders {
+		canonicalHeaderBuilder.WriteString(name)
+		canonicalHeaderBuilder.WriteString(":")
+		canonicalHeaderBuilder.WriteString(strings.TrimSpace(headers[name]))
+		canonicalHeaderBuilder.WriteString("\n")
+	}
+	canonicalRequest := strings.Join([]string{
+		method,
+		canonicalURI(&targetURL),
+		canonicalQuery(&targetURL),
+		canonicalHeaderBuilder.String(),
+		strings.Join(signedHeaders, ";"),
+		payloadHash,
+	}, "\n")
+	stringToSign := strings.Join([]string{
+		"AWS4-HMAC-SHA256",
+		now.Format("20060102T150405Z"),
+		scope,
+		sha256HexString(canonicalRequest),
+	}, "\n")
+	signature := hex.EncodeToString(hmacSHA256(signingKey(s.cfg.SecretAccessKey, shortDate, s.cfg.Region, "s3"), stringToSign))
+	targetURL.RawQuery = canonicalQuery(&targetURL) + "&X-Amz-Signature=" + signature
+
+	return DirectUploadTarget{
+		Method: method,
+		URL:    targetURL.String(),
+		Headers: map[string]string{
+			"Content-Type":         contentType,
+			"X-Amz-Content-Sha256": payloadHash,
+		},
+		ExpiresAt: now.Add(expires),
+	}, nil
+}
+
 func (s *S3) HealthCheck(ctx context.Context) error {
 	req, err := s.newBucketRequest(ctx, http.MethodHead, nil, emptyPayloadSHA256)
 	if err != nil {
@@ -272,6 +360,26 @@ func (s *S3) objectProbe(ctx context.Context) error {
 func (s *S3) newObjectRequest(ctx context.Context, method, key string, body io.Reader, payloadHash string) (*http.Request, error) {
 	targetURL := s.objectURL(JoinBasePath(s.cfg.BasePath, key))
 	return s.newSignedRequest(ctx, method, &targetURL, body, payloadHash)
+}
+
+func (s *S3) ReadPrefix(ctx context.Context, key string, size int64) ([]byte, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	req, err := s.newObjectRequest(ctx, http.MethodGet, key, nil, emptyPayloadSHA256)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", size-1))
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer drainAndClose(resp.Body)
+	if err := requireStatus(resp, http.StatusOK, http.StatusPartialContent); err != nil {
+		return nil, fmt.Errorf("s3 read prefix failed: %w", err)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, size))
 }
 
 func (s *S3) objectURL(key string) url.URL {

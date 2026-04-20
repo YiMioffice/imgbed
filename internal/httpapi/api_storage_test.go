@@ -2,6 +2,10 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -127,6 +131,186 @@ func TestS3CompatibleStorageUploadAndServe(t *testing.T) {
 	}
 }
 
+func TestS3DirectUploadInitComplete(t *testing.T) {
+	api := testAPI(t, true)
+	disableGuestImageCompression(t, api)
+	server := newMemoryObjectServer("s3")
+	defer server.Close()
+
+	putStorageConfig(t, api, "s3-default", `{
+		"type":"s3",
+		"name":"S3 存储",
+		"endpoint":"`+server.URL()+`",
+		"region":"auto",
+		"bucket":"assets",
+		"accessKeyId":"test-access",
+		"secretAccessKey":"test-secret",
+		"usePathStyle":true,
+		"basePath":"uploads",
+		"isDefault":true
+	}`)
+
+	hash := sha256.Sum256(tinyPNG)
+	hashHex := hex.EncodeToString(hash[:])
+	initBody, err := json.Marshal(map[string]any{
+		"filename":     "sample.png",
+		"contentType":  "image/png",
+		"size":         len(tinyPNG),
+		"sha256":       hashHex,
+		"headerBase64": base64.StdEncoding.EncodeToString(tinyPNG),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initReq := httptest.NewRequest(http.MethodPost, "/api/v1/resources/direct-upload/init", bytes.NewReader(initBody))
+	initReq.Header.Set("Content-Type", "application/json")
+	initRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("direct init status = %d, want %d; body: %s", initRec.Code, http.StatusOK, initRec.Body.String())
+	}
+	var initPayload struct {
+		Upload struct {
+			Method  string            `json:"method"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+		} `json:"upload"`
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(initRec.Body).Decode(&initPayload); err != nil {
+		t.Fatal(err)
+	}
+	if initPayload.Token == "" || initPayload.Upload.URL == "" {
+		t.Fatalf("direct init payload missing token or upload url: %+v", initPayload)
+	}
+
+	putReq, err := http.NewRequest(initPayload.Upload.Method, initPayload.Upload.URL, bytes.NewReader(tinyPNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range initPayload.Upload.Headers {
+		putReq.Header.Set(name, value)
+	}
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, putResp.Body)
+	_ = putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("direct put status = %d, want %d", putResp.StatusCode, http.StatusOK)
+	}
+
+	completeBody, err := json.Marshal(map[string]string{"token": initPayload.Token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeReq := httptest.NewRequest(http.MethodPost, "/api/v1/resources/direct-upload/complete", bytes.NewReader(completeBody))
+	completeReq.Header.Set("Content-Type", "application/json")
+	completeRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(completeRec, completeReq)
+	if completeRec.Code != http.StatusCreated {
+		t.Fatalf("direct complete status = %d, want %d; body: %s", completeRec.Code, http.StatusCreated, completeRec.Body.String())
+	}
+	var completePayload struct {
+		Resource resource.Record `json:"resource"`
+	}
+	if err := json.NewDecoder(completeRec.Body).Decode(&completePayload); err != nil {
+		t.Fatal(err)
+	}
+	if completePayload.Resource.ID != hashHex[:16] {
+		t.Fatalf("direct resource id = %q, want %q", completePayload.Resource.ID, hashHex[:16])
+	}
+	if completePayload.Resource.StorageDriver != "s3-default" {
+		t.Fatalf("storage driver = %q, want s3-default", completePayload.Resource.StorageDriver)
+	}
+	if got := server.objectCount(); got != 1 {
+		t.Fatalf("object count = %d, want 1", got)
+	}
+}
+
+func TestS3DirectUploadRejectsMismatchedObjectHeader(t *testing.T) {
+	api := testAPI(t, true)
+	disableGuestImageCompression(t, api)
+	server := newMemoryObjectServer("s3")
+	defer server.Close()
+
+	putStorageConfig(t, api, "s3-default", `{
+		"type":"s3",
+		"name":"S3 存储",
+		"endpoint":"`+server.URL()+`",
+		"region":"auto",
+		"bucket":"assets",
+		"accessKeyId":"test-access",
+		"secretAccessKey":"test-secret",
+		"usePathStyle":true,
+		"basePath":"uploads",
+		"isDefault":true
+	}`)
+
+	body := []byte("<html><body>bad</body></html>")
+	hash := sha256.Sum256(body)
+	initBody, err := json.Marshal(map[string]any{
+		"filename":     "sample.png",
+		"contentType":  "image/png",
+		"size":         len(body),
+		"sha256":       hex.EncodeToString(hash[:]),
+		"headerBase64": base64.StdEncoding.EncodeToString(tinyPNG),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initReq := httptest.NewRequest(http.MethodPost, "/api/v1/resources/direct-upload/init", bytes.NewReader(initBody))
+	initReq.Header.Set("Content-Type", "application/json")
+	initRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("direct init status = %d, want %d; body: %s", initRec.Code, http.StatusOK, initRec.Body.String())
+	}
+	var initPayload struct {
+		Upload struct {
+			Method  string            `json:"method"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+		} `json:"upload"`
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(initRec.Body).Decode(&initPayload); err != nil {
+		t.Fatal(err)
+	}
+	putReq, err := http.NewRequest(initPayload.Upload.Method, initPayload.Upload.URL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range initPayload.Upload.Headers {
+		putReq.Header.Set(name, value)
+	}
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, putResp.Body)
+	_ = putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("direct put status = %d, want %d", putResp.StatusCode, http.StatusOK)
+	}
+
+	completeBody, err := json.Marshal(map[string]string{"token": initPayload.Token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completeReq := httptest.NewRequest(http.MethodPost, "/api/v1/resources/direct-upload/complete", bytes.NewReader(completeBody))
+	completeReq.Header.Set("Content-Type", "application/json")
+	completeRec := httptest.NewRecorder()
+	api.Routes().ServeHTTP(completeRec, completeReq)
+	if completeRec.Code != http.StatusBadRequest {
+		t.Fatalf("direct complete status = %d, want %d; body: %s", completeRec.Code, http.StatusBadRequest, completeRec.Body.String())
+	}
+	if got := server.objectCount(); got != 0 {
+		t.Fatalf("object count after rejected complete = %d, want 0", got)
+	}
+}
+
 func putStorageConfig(t *testing.T, api *API, id, body string) {
 	t.Helper()
 
@@ -138,6 +322,26 @@ func putStorageConfig(t *testing.T, api *API, id, body string) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("save storage config status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
+}
+
+func disableGuestImageCompression(t *testing.T, api *API) {
+	t.Helper()
+
+	groups, err := api.app.Data.UserGroups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range groups {
+		if group.ID != "guest" {
+			continue
+		}
+		group.ImageCompressionEnabled = false
+		if _, err := api.app.Data.UpdateUserGroup(context.Background(), group); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Fatal("guest group not found")
 }
 
 func uploadTestPNGRecord(t *testing.T, api *API) (string, resource.Record) {
@@ -242,6 +446,24 @@ func (s *memoryObjectServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		if rawRange := strings.TrimSpace(r.Header.Get("Range")); strings.HasPrefix(rawRange, "bytes=0-") {
+			end, err := strconv.Atoi(strings.TrimPrefix(rawRange, "bytes=0-"))
+			if err != nil || end < 0 {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			if end >= len(body) {
+				end = len(body) - 1
+			}
+			if end < 0 {
+				w.WriteHeader(http.StatusPartialContent)
+				return
+			}
+			w.Header().Set("Content-Range", "bytes 0-"+strconv.Itoa(end)+"/"+strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[:end+1])
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	case http.MethodDelete:

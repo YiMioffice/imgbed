@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,6 +41,10 @@ type API struct {
 }
 
 const sessionCookieName = "machring_session"
+const directUploadTokenVersion = 1
+const directUploadExpires = 15 * time.Minute
+const directUploadValidationBytes = 64 << 10
+const directUploadSniffBytes = 512
 
 func New(app *app.App) *API {
 	return &API{
@@ -96,6 +102,8 @@ func (api *API) Routes() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/resources/{id}", api.deleteResource)
 	mux.HandleFunc("POST /api/v1/resources/{id}/restore", api.restoreResource)
 	mux.HandleFunc("POST /api/v1/resources/upload", api.uploadResource)
+	mux.HandleFunc("POST /api/v1/resources/direct-upload/init", api.initDirectUpload)
+	mux.HandleFunc("POST /api/v1/resources/direct-upload/complete", api.completeDirectUpload)
 	mux.HandleFunc("GET /api/v1/stats/overview", api.statsOverview)
 	mux.HandleFunc("HEAD /r/{id}", api.serveResource)
 	mux.HandleFunc("GET /r/{id}", api.serveResource)
@@ -694,6 +702,37 @@ type signedLinkRequest struct {
 	ExpiresInSeconds int64 `json:"expiresInSeconds"`
 }
 
+type directUploadInitRequest struct {
+	Filename        string `json:"filename"`
+	ContentType     string `json:"contentType"`
+	Size            int64  `json:"size"`
+	SHA256          string `json:"sha256"`
+	HeaderBase64    string `json:"headerBase64"`
+	DeliveryRouteID string `json:"deliveryRouteId"`
+}
+
+type directUploadCompleteRequest struct {
+	Token string `json:"token"`
+}
+
+type directUploadToken struct {
+	Version         int    `json:"v"`
+	ExpiresAt       int64  `json:"exp"`
+	StorageID       string `json:"storageId"`
+	ObjectKey       string `json:"objectKey"`
+	Filename        string `json:"filename"`
+	ContentType     string `json:"contentType"`
+	Size            int64  `json:"size"`
+	SHA256          string `json:"sha256"`
+	UserGroup       string `json:"userGroup"`
+	OwnerUserID     string `json:"ownerUserId"`
+	OwnerUsername   string `json:"ownerUsername"`
+	UploadIP        string `json:"uploadIp"`
+	UploadUserAgent string `json:"uploadUserAgent"`
+	DeliveryRouteID string `json:"deliveryRouteId"`
+	PublicBaseURL   string `json:"publicBaseUrl"`
+}
+
 func (api *API) siteSettings(w http.ResponseWriter, r *http.Request) {
 	settings, err := api.app.Data.SiteSettings(r.Context())
 	if err != nil {
@@ -852,6 +891,16 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusMultiStatus
 	}
 
+	writeUploadItemsResponse(w, status, items)
+}
+
+func writeUploadItemsResponse(w http.ResponseWriter, status int, items []uploadItemResponse) {
+	successes := 0
+	for _, item := range items {
+		if item.Success {
+			successes++
+		}
+	}
 	payload := map[string]any{
 		"items": items,
 		"summary": map[string]int{
@@ -874,6 +923,450 @@ func (api *API) uploadResource(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, status, payload)
+}
+
+func (api *API) initDirectUpload(w http.ResponseWriter, r *http.Request) {
+	clientAddr := clientIP(r)
+	if allowed, resetAt, _ := api.uploadLimiter.Allow(clientAddr, time.Now()); !allowed {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"error": uploadError{
+				Code:    "upload_rate_limited",
+				Message: fmt.Sprintf("too many upload requests, retry after %s", resetAt.UTC().Format(time.RFC3339)),
+			},
+		})
+		return
+	}
+
+	actor, hasActor := api.currentUserFromRequest(r)
+	settings, err := api.app.Data.SiteSettings(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to load site settings", err))
+		return
+	}
+	if !hasActor && !settings.AllowGuestUploads {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error": uploadError{Code: "guest_uploads_disabled", Message: "guest uploads are disabled"},
+		})
+		return
+	}
+
+	var req directUploadInitRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("invalid direct upload payload", err))
+		return
+	}
+	if req.Size < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "invalid_size", Message: "size must be greater than or equal to 0"},
+		})
+		return
+	}
+	payloadHash := strings.ToLower(strings.TrimSpace(req.SHA256))
+	if !isSHA256Hex(payloadHash) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "invalid_hash", Message: "sha256 must be a 64 character hex digest"},
+		})
+		return
+	}
+	headerBytes, err := decodeDirectUploadHeader(req.HeaderBase64, req.Size)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "invalid_header", Message: err.Error()},
+		})
+		return
+	}
+
+	group := policy.GroupGuest
+	var actorPtr *auth.User
+	if hasActor {
+		group = strings.TrimSpace(actor.GroupID)
+		if group == "" {
+			group = policy.GroupGuest
+		}
+		actorPtr = &actor
+	}
+
+	cleanedName := sanitizeUploadFilename(req.Filename)
+	declaredContentType := normalizeContentType(req.ContentType)
+	sniffContentType := normalizeContentType(http.DetectContentType(headerBytes))
+	meta := api.app.Detector.Detect(cleanedName, declaredContentType, headerBytes, req.Size)
+	meta.ContentType = sniffContentType
+	if err := validateUploadMetadata(meta, sniffContentType); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"metadata": meta,
+			"error":    uploadError{Code: "content_type_mismatch", Message: err.Error()},
+		})
+		return
+	}
+
+	_, decision, err := api.resolvePolicy(r.Context(), policy.ActionUpload, group, meta)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to resolve policy", err))
+		return
+	}
+	if !decision.Allowed {
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "policy_rejected", Message: decision.Reason},
+		})
+		return
+	}
+
+	groupConfig, err := api.userGroupByID(r.Context(), group)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "group_not_found", Message: "user group not found"},
+		})
+		return
+	}
+	if meta.Type == resource.TypeImage && groupConfig.ImageCompressionEnabled && isCompressibleImage(meta) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "direct_upload_unavailable", Message: "direct upload is unavailable while image compression is enabled"},
+		})
+		return
+	}
+	if status, quotaErr := api.checkUploadQuota(r.Context(), actorPtr, groupConfig, meta.Size, clientAddr); quotaErr != nil {
+		writeJSON(w, status, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    quotaErr,
+		})
+		return
+	}
+
+	defaultStorageID, activeStore, _, err := api.resolveDefaultStore(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "storage_unavailable", Message: "failed to resolve active storage"},
+		})
+		return
+	}
+	directUploader, ok := activeStore.(storage.DirectUploader)
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "direct_upload_unavailable", Message: "active storage does not support direct browser upload"},
+		})
+		return
+	}
+
+	requestedDeliveryRouteID := strings.TrimSpace(req.DeliveryRouteID)
+	deliveryRoute, err := api.resolveUploadDeliveryRoute(r.Context(), requestedDeliveryRouteID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "delivery_route_invalid", Message: err.Error()},
+		})
+		return
+	}
+
+	now := time.Now()
+	objectKey := buildObjectKey(now, payloadHash, meta.Extension)
+	target, err := directUploader.DirectUploadURL(r.Context(), objectKey, storage.DirectUploadOptions{
+		Method:        http.MethodPut,
+		Expires:       directUploadExpires,
+		ContentType:   meta.ContentType,
+		PayloadSHA256: payloadHash,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"metadata": meta,
+			"decision": decision,
+			"error":    uploadError{Code: "direct_upload_sign_failed", Message: "failed to sign direct upload"},
+		})
+		return
+	}
+	token, err := api.signDirectUploadToken(r.Context(), directUploadToken{
+		Version:         directUploadTokenVersion,
+		ExpiresAt:       target.ExpiresAt.Unix(),
+		StorageID:       defaultStorageID,
+		ObjectKey:       objectKey,
+		Filename:        cleanedName,
+		ContentType:     meta.ContentType,
+		Size:            meta.Size,
+		SHA256:          payloadHash,
+		UserGroup:       group,
+		OwnerUserID:     ownerUserID(actorPtr),
+		OwnerUsername:   ownerUsername(actorPtr),
+		UploadIP:        clientAddr,
+		UploadUserAgent: r.UserAgent(),
+		DeliveryRouteID: deliveryRoute.ID,
+		PublicBaseURL:   api.publicResourceBaseURLForRoute(settings, deliveryRoute),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to sign upload token", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"upload":   target,
+		"token":    token,
+		"metadata": meta,
+		"decision": decision,
+	})
+}
+
+func (api *API) completeDirectUpload(w http.ResponseWriter, r *http.Request) {
+	var req directUploadCompleteRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorPayload("invalid direct upload completion payload", err))
+		return
+	}
+	uploadToken, err := api.verifyDirectUploadToken(r.Context(), req.Token)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "invalid_direct_upload_token", Message: err.Error()},
+		})
+		return
+	}
+
+	actor, hasActor := api.currentUserFromRequest(r)
+	if uploadToken.OwnerUserID != "" {
+		if !hasActor || actor.ID != uploadToken.OwnerUserID {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": uploadError{Code: "upload_owner_mismatch", Message: "direct upload token does not belong to the current user"},
+			})
+			return
+		}
+	} else {
+		settings, err := api.app.Data.SiteSettings(r.Context())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, errorPayload("failed to load site settings", err))
+			return
+		}
+		if !settings.AllowGuestUploads {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": uploadError{Code: "guest_uploads_disabled", Message: "guest uploads are disabled"},
+			})
+			return
+		}
+	}
+	var actorPtr *auth.User
+	if uploadToken.OwnerUserID != "" {
+		actorPtr = &actor
+	}
+
+	storageID, activeStore, _, err := api.resolveStoreByID(r.Context(), uploadToken.StorageID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": uploadError{Code: "storage_unavailable", Message: "failed to resolve signed storage"},
+		})
+		return
+	}
+	stat, err := activeStore.Stat(r.Context(), uploadToken.ObjectKey)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "direct_upload_missing", Message: "uploaded object was not found in storage"},
+		})
+		return
+	}
+	if stat.Size != uploadToken.Size {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "direct_upload_size_mismatch", Message: "uploaded object size does not match the signed upload"},
+		})
+		return
+	}
+	prefixBytes, err := readStoragePrefix(r.Context(), activeStore, uploadToken.ObjectKey, directUploadValidationBytes)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": uploadError{Code: "direct_upload_validation_failed", Message: "failed to validate uploaded object"},
+		})
+		return
+	}
+	if uploadToken.Size > 0 && len(prefixBytes) == 0 {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": uploadError{Code: "direct_upload_empty_validation", Message: "uploaded object could not be validated"},
+		})
+		return
+	}
+
+	sniffBytes := prefixBytes
+	if len(sniffBytes) > directUploadSniffBytes {
+		sniffBytes = sniffBytes[:directUploadSniffBytes]
+	}
+	sniffContentType := normalizeContentType(http.DetectContentType(sniffBytes))
+	meta := api.app.Detector.Detect(uploadToken.Filename, uploadToken.ContentType, sniffBytes, uploadToken.Size)
+	meta.ContentType = sniffContentType
+	if err := validateUploadMetadata(meta, sniffContentType); err != nil {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		item := uploadItemResponse{
+			Status:   http.StatusBadRequest,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Error:    &uploadError{Code: "content_type_mismatch", Message: err.Error()},
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+	_, decision, err := api.resolvePolicy(r.Context(), policy.ActionUpload, uploadToken.UserGroup, meta)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorPayload("failed to resolve policy", err))
+		return
+	}
+	if !decision.Allowed {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		item := uploadItemResponse{
+			Status:   http.StatusForbidden,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Decision: &decision,
+			Error:    &uploadError{Code: "policy_rejected", Message: decision.Reason},
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+	groupConfig, err := api.userGroupByID(r.Context(), uploadToken.UserGroup)
+	if err != nil {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		item := uploadItemResponse{
+			Status:   http.StatusBadRequest,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Decision: &decision,
+			Error:    &uploadError{Code: "group_not_found", Message: "user group not found"},
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+	if meta.Type == resource.TypeImage && groupConfig.ImageCompressionEnabled && isCompressibleImage(meta) {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		item := uploadItemResponse{
+			Status:   http.StatusConflict,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Decision: &decision,
+			Error:    &uploadError{Code: "direct_upload_unavailable", Message: "direct upload is unavailable while image compression is enabled"},
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+	if status, quotaErr := api.checkUploadQuota(r.Context(), actorPtr, groupConfig, meta.Size, uploadToken.UploadIP); quotaErr != nil {
+		_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+		item := uploadItemResponse{
+			Status:   status,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Decision: &decision,
+			Error:    quotaErr,
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+
+	imageWidth, imageHeight, imageDecoded := 0, 0, false
+	if meta.Type == resource.TypeImage && shouldValidateImage(meta.Extension, meta.ContentType) {
+		imageWidth, imageHeight, imageDecoded = resource.DecodeImageConfig(prefixBytes)
+		if !imageDecoded {
+			_ = activeStore.Delete(r.Context(), uploadToken.ObjectKey)
+			item := uploadItemResponse{
+				Status:   http.StatusBadRequest,
+				Filename: uploadToken.Filename,
+				Metadata: meta,
+				Decision: &decision,
+				Error:    &uploadError{Code: "invalid_image", Message: "image decode validation failed"},
+			}
+			writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+			return
+		}
+	}
+
+	now := time.Now()
+	id := uploadToken.SHA256[:16]
+	directURL := strings.TrimRight(uploadToken.PublicBaseURL, "/") + "/r/" + id
+	monthlyLimit := decision.Rule.MonthlyTrafficPerResourceBytes
+	if monthlyLimit <= 0 && groupConfig.DefaultMonthlyTrafficBytes > 0 {
+		monthlyLimit = groupConfig.DefaultMonthlyTrafficBytes
+	}
+	record := resource.Record{
+		ID:              id,
+		OwnerUserID:     uploadToken.OwnerUserID,
+		OwnerUsername:   uploadToken.OwnerUsername,
+		UserGroup:       uploadToken.UserGroup,
+		IsPrivate:       decision.Rule.ForcePrivate,
+		StorageDriver:   storageID,
+		ObjectKey:       uploadToken.ObjectKey,
+		DeliveryRouteID: uploadToken.DeliveryRouteID,
+		PublicURL:       directURL,
+		OriginalName:    uploadToken.Filename,
+		Extension:       meta.Extension,
+		Type:            meta.Type,
+		Size:            meta.Size,
+		ContentType:     meta.ContentType,
+		Hash:            uploadToken.SHA256,
+		Status:          resource.StatusActive,
+		CacheControl:    decision.Rule.CacheControl,
+		Disposition:     decision.Rule.DownloadDisposition,
+		MonthlyLimit:    monthlyLimit,
+		MonthWindow:     now.Format("2006-01"),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		UploadIP:        uploadToken.UploadIP,
+		UploadUserAgent: uploadToken.UploadUserAgent,
+	}
+	headerDigest := sha256.Sum256(sniffBytes)
+	metadata := resource.StoredMetadata{
+		ResourceID:   id,
+		HeaderSHA256: hex.EncodeToString(headerDigest[:]),
+		ImageWidth:   imageWidth,
+		ImageHeight:  imageHeight,
+		ImageDecoded: imageDecoded,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	variant := resource.Variant{
+		ID:            id + "_original",
+		ResourceID:    id,
+		Kind:          "original",
+		StorageDriver: storageID,
+		ObjectKey:     record.ObjectKey,
+		ContentType:   record.ContentType,
+		Size:          record.Size,
+		Width:         imageWidth,
+		Height:        imageHeight,
+		CreatedAt:     now,
+	}
+	if err := api.app.Data.CreateResource(r.Context(), persist.CreateResourceBundle{
+		Record:   record,
+		Metadata: metadata,
+		Variants: []resource.Variant{variant},
+	}); err != nil {
+		item := uploadItemResponse{
+			Status:   http.StatusInternalServerError,
+			Filename: uploadToken.Filename,
+			Metadata: meta,
+			Decision: &decision,
+			Error:    &uploadError{Code: "persist_failed", Message: "failed to save resource record"},
+		}
+		writeUploadItemsResponse(w, item.Status, []uploadItemResponse{item})
+		return
+	}
+
+	links := resource.BuildLinks(uploadToken.Filename, directURL, meta.Type)
+	item := uploadItemResponse{
+		Success:  true,
+		Status:   http.StatusCreated,
+		Filename: uploadToken.Filename,
+		Metadata: meta,
+		Decision: &decision,
+		Resource: &record,
+		Links:    &links,
+	}
+	writeUploadItemsResponse(w, http.StatusCreated, []uploadItemResponse{item})
 }
 
 func (api *API) accountUsage(w http.ResponseWriter, r *http.Request) {
@@ -2226,6 +2719,115 @@ func (api *API) shouldSerializeUploads(ctx context.Context, group string) bool {
 		return true
 	}
 	return groupConfig.TotalCapacityBytes > 0 || groupConfig.DailyUploadLimit > 0
+}
+
+func decodeDirectUploadHeader(raw string, size int64) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if size == 0 {
+			return nil, nil
+		}
+		return nil, errors.New("headerBase64 is required")
+	}
+	if len(raw) > base64.StdEncoding.EncodedLen(directUploadSniffBytes)+4 {
+		return nil, errors.New("headerBase64 is too large")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, errors.New("headerBase64 must be valid base64")
+	}
+	if len(decoded) > directUploadSniffBytes {
+		return nil, errors.New("headerBase64 exceeds validation header size")
+	}
+	return decoded, nil
+}
+
+func isSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func (api *API) signDirectUploadToken(ctx context.Context, token directUploadToken) (string, error) {
+	secret, err := api.app.Data.SigningSecret(ctx)
+	if err != nil {
+		return "", err
+	}
+	payloadBytes, err := json.Marshal(token)
+	if err != nil {
+		return "", err
+	}
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return payload + "." + directUploadSignature(secret, payload), nil
+}
+
+func (api *API) verifyDirectUploadToken(ctx context.Context, raw string) (directUploadToken, error) {
+	raw = strings.TrimSpace(raw)
+	payload, signature, ok := strings.Cut(raw, ".")
+	if !ok || payload == "" || signature == "" {
+		return directUploadToken{}, errors.New("invalid upload token")
+	}
+	secret, err := api.app.Data.SigningSecret(ctx)
+	if err != nil {
+		return directUploadToken{}, err
+	}
+	expected := directUploadSignature(secret, payload)
+	if !hmac.Equal([]byte(signature), []byte(expected)) {
+		return directUploadToken{}, errors.New("invalid upload token signature")
+	}
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return directUploadToken{}, errors.New("invalid upload token payload")
+	}
+	var token directUploadToken
+	if err := json.Unmarshal(payloadBytes, &token); err != nil {
+		return directUploadToken{}, errors.New("invalid upload token payload")
+	}
+	switch {
+	case token.Version != directUploadTokenVersion:
+		return directUploadToken{}, errors.New("unsupported upload token version")
+	case time.Now().Unix() > token.ExpiresAt:
+		return directUploadToken{}, errors.New("direct upload token expired")
+	case strings.TrimSpace(token.StorageID) == "":
+		return directUploadToken{}, errors.New("upload token is missing storage")
+	case strings.TrimSpace(token.ObjectKey) == "":
+		return directUploadToken{}, errors.New("upload token is missing object key")
+	case token.Size < 0:
+		return directUploadToken{}, errors.New("upload token has invalid size")
+	case !isSHA256Hex(token.SHA256):
+		return directUploadToken{}, errors.New("upload token has invalid hash")
+	}
+	token.SHA256 = strings.ToLower(token.SHA256)
+	token.Filename = sanitizeUploadFilename(token.Filename)
+	token.ContentType = normalizeContentType(token.ContentType)
+	token.UserGroup = strings.TrimSpace(token.UserGroup)
+	if token.UserGroup == "" {
+		token.UserGroup = policy.GroupGuest
+	}
+	return token, nil
+}
+
+func directUploadSignature(secret, payload string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(payload))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func readStoragePrefix(ctx context.Context, store storage.Store, key string, size int64) ([]byte, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	if prefixReader, ok := store.(storage.PrefixReader); ok {
+		return prefixReader.ReadPrefix(ctx, key, size)
+	}
+	reader, err := store.Open(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(io.LimitReader(reader, size))
 }
 
 func multipartUploadError(err error) (int, uploadError) {

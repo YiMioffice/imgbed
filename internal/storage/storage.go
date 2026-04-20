@@ -40,3 +40,25 @@ type RedirectOptions struct {
 type Redirector interface {
 	RedirectURL(ctx context.Context, key string, options RedirectOptions) (string, error)
 }
+
+type DirectUploadOptions struct {
+	Method        string
+	Expires       time.Duration
+	ContentType   string
+	PayloadSHA256 string
+}
+
+type DirectUploadTarget struct {
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Headers   map[string]string `json:"headers"`
+	ExpiresAt time.Time         `json:"expiresAt"`
+}
+
+type DirectUploader interface {
+	DirectUploadURL(ctx context.Context, key string, options DirectUploadOptions) (DirectUploadTarget, error)
+}
+
+type PrefixReader interface {
+	ReadPrefix(ctx context.Context, key string, size int64) ([]byte, error)
+}

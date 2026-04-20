@@ -574,7 +574,18 @@
     }
   }
 
-  function uploadWithProgress(files: File[], onProgress: (ratio: number, speedBps: number) => void) {
+  class DirectUploadFallbackError extends Error {}
+
+  async function uploadWithProgress(files: File[], onProgress: (ratio: number, speedBps: number) => void) {
+    try {
+      return await uploadDirectWithProgress(files, onProgress);
+    } catch (error) {
+      if (error instanceof DirectUploadFallbackError) return uploadMultipartWithProgress(files, onProgress);
+      throw error;
+    }
+  }
+
+  function uploadMultipartWithProgress(files: File[], onProgress: (ratio: number, speedBps: number) => void) {
     return new Promise<any>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const startedAt = performance.now();
@@ -597,6 +608,148 @@
       files.forEach((file) => form.append('files', file, file.name));
       xhr.send(form);
     });
+  }
+
+  async function uploadDirectWithProgress(files: File[], onProgress: (ratio: number, speedBps: number) => void) {
+    if (!crypto?.subtle) throw new DirectUploadFallbackError('浏览器不支持安全直传校验');
+    const total = files.reduce((sum, file) => sum + Math.max(file.size, 1), 0);
+    const startedAt = performance.now();
+    let uploadedBytes = 0;
+    const items: UploadItemResponse[] = [];
+    for (const file of files) {
+      const sha256 = await sha256Hex(file);
+      const initRes = await fetch('/api/v1/resources/direct-upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          contentType: file.type || 'application/octet-stream',
+          size: file.size,
+          sha256,
+          headerBase64: await fileHeaderBase64(file),
+          deliveryRouteId: selectedDeliveryRouteId || undefined
+        })
+      });
+      const initPayload = await readJSONResponse(initRes);
+      if (!initRes.ok) {
+        if (initPayload?.error?.code === 'direct_upload_unavailable' && items.length === 0 && uploadedBytes === 0) {
+          throw new DirectUploadFallbackError(initPayload.error.message || '当前存储不支持直传');
+        }
+        items.push(uploadItemFromError(file, initRes.status, initPayload));
+        continue;
+      }
+
+      await putDirectUpload(file, initPayload.upload, (fileLoaded) => {
+        const currentLoaded = uploadedBytes + fileLoaded;
+        const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.1);
+        onProgress(Math.min(currentLoaded / total, 1), currentLoaded / elapsedSeconds);
+      });
+      uploadedBytes += Math.max(file.size, 1);
+      const elapsedSeconds = Math.max((performance.now() - startedAt) / 1000, 0.1);
+      onProgress(Math.min(uploadedBytes / total, 1), uploadedBytes / elapsedSeconds);
+
+      const completeRes = await fetch('/api/v1/resources/direct-upload/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: initPayload.token })
+      });
+      const completePayload = await readJSONResponse(completeRes);
+      const completeItems = (completePayload.items ?? []) as UploadItemResponse[];
+      if (completeItems.length > 0) {
+        items.push(completeItems[0]);
+        continue;
+      }
+      if (!completeRes.ok) throw new Error(uploadHTTPErrorMessage(completeRes.status, completePayload));
+      items.push(uploadItemFromError(file, completeRes.status, completePayload));
+    }
+    return uploadPayloadFromItems(items);
+  }
+
+  function putDirectUpload(file: File, upload: any, onFileProgress: (loaded: number) => void) {
+    return new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(upload?.method || 'PUT', upload?.url || '');
+      for (const [key, value] of Object.entries(upload?.headers ?? {})) {
+        xhr.setRequestHeader(key, String(value));
+      }
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onFileProgress(event.loaded);
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) return resolve();
+        reject(new Error(`S3 直传失败：HTTP ${xhr.status}`));
+      };
+      xhr.onerror = () => reject(new Error('S3 直传请求失败，请检查存储桶 CORS 是否允许 PUT、Content-Type 和 X-Amz-Content-Sha256。'));
+      xhr.send(file);
+    });
+  }
+
+  async function sha256Hex(file: File) {
+    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function fileHeaderBase64(file: File) {
+    if (file.size === 0) return '';
+    const buffer = await file.slice(0, 512).arrayBuffer();
+    return arrayBufferToBase64(buffer);
+  }
+
+  function arrayBufferToBase64(buffer: ArrayBuffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  async function readJSONResponse(response: Response) {
+    const text = (await response.text()).trim();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { error: { message: uploadHTTPErrorMessage(response.status, null) } };
+    }
+  }
+
+  function uploadItemFromError(file: File, status: number, payload: any): UploadItemResponse {
+    return {
+      success: false,
+      status,
+      filename: file.name,
+      metadata: payload?.metadata ?? fallbackUploadMetadata(file),
+      decision: payload?.decision,
+      error: payload?.error ?? { code: 'upload_failed', message: uploadHTTPErrorMessage(status, payload) }
+    };
+  }
+
+  function fallbackUploadMetadata(file: File) {
+    const dot = file.name.lastIndexOf('.');
+    return {
+      filename: file.name,
+      extension: dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : '',
+      type: 'other',
+      contentType: file.type || 'application/octet-stream',
+      size: file.size
+    };
+  }
+
+  function uploadPayloadFromItems(items: UploadItemResponse[]) {
+    const succeeded = items.filter((item) => item.success).length;
+    const payload: any = {
+      items,
+      summary: { total: items.length, succeeded, failed: items.length - succeeded }
+    };
+    if (items.length === 1) {
+      payload.metadata = items[0].metadata;
+      payload.decision = items[0].decision;
+      if (items[0].resource) payload.resource = items[0].resource;
+      if (items[0].links) payload.links = items[0].links;
+      if (items[0].error) payload.error = items[0].error;
+    }
+    return payload;
   }
 
   function parseUploadResponse(xhr: XMLHttpRequest) {
